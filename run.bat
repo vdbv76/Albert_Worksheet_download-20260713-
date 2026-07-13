@@ -10,10 +10,16 @@ REM --- Always run from the folder this .bat lives in --------------------------
 cd /d "%~dp0"
 
 REM --- Find a Python launcher -------------------------------------------------
-REM  Prefer the "py" launcher with -3, which selects the NEWEST installed
-REM  Python 3.x. Fall back to "py" and then to "python" on PATH.
+REM  1) A known local Python 3.12 install (this machine keeps it here, off PATH).
+REM     Edit PYHOME below if your Python lives somewhere else.
+REM  2) Otherwise the "py" launcher with -3 (newest installed Python 3.x).
+REM  3) Otherwise plain "python" on PATH.
 set "PY="
-where py >nul 2>nul && set "PY=py -3"
+set "PYHOME=C:\Users\bujvilal\python312"
+if exist "%PYHOME%\python.exe" set "PY="%PYHOME%\python.exe""
+if not defined PY (
+    where py >nul 2>nul && set "PY=py -3"
+)
 if not defined PY (
     where python >nul 2>nul && set "PY=python"
 )
