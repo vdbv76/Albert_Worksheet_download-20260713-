@@ -997,14 +997,43 @@ def rows_dataframe(section: dict, row_filter: dict | None = None, with_ids: bool
     return (df, rids) if with_ids else df
 
 
-def _merge_runs(rows: list[list[str]], n_merge: int) -> list[list[int]]:
+def _merge_parents(names: list[str]) -> list[list[int]]:
+    """Which already-merged columns each merge column depends on (its 'parents').
+
+    Default hierarchy is strictly left-to-right, BUT interval columns are special:
+    a time point (Interval 1/2) repeats across every property measured at it, so
+    gating it behind Data Column / Unit would keep it from merging on a multi-
+    property task. Instead an interval merges on its own repeated values, gated
+    only by the OUTERMOST key (Data Template / Property Task) and any interval
+    column to its left - so it still respects the top-level block boundary but
+    spans across the different properties inside one block."""
+    parents: list[list[int]] = []
+    nonint: list[int] = []
+    inte: list[int] = []
+    for i, nm in enumerate(names):
+        if str(nm).startswith("Interval "):
+            parents.append(([nonint[0]] if nonint else []) + inte[:])
+            inte.append(i)
+        else:
+            parents.append(list(nonint))
+            nonint.append(i)
+    return parents
+
+
+def _merge_runs(
+    rows: list[list[str]], n_merge: int, parents: list[list[int]] | None = None
+) -> list[list[int]]:
     """For the first n_merge columns, compute the rowspan of each cell.
     span[r][c] = number of rows this cell spans (0 = absorbed by the cell above).
-    A change in an OUTER column always breaks the run in the inner ones, so
-    'Cobb Value' under a new Data Template starts a fresh merge."""
+    `parents[c]` lists the columns that must still be merged for column c to keep
+    a run going; when omitted it is every column to the left (a plain hierarchy),
+    so 'Cobb Value' under a new Data Template starts a fresh merge."""
     n = len(rows)
     span = [[1] * n_merge for _ in range(n)]
+    if parents is None:
+        parents = [list(range(c)) for c in range(n_merge)]
     for c in range(n_merge):
+        gate = parents[c]
         r = 0
         while r < n:
             k = r + 1
@@ -1012,7 +1041,7 @@ def _merge_runs(rows: list[list[str]], n_merge: int) -> list[list[int]]:
                 k < n
                 and rows[k][c] == rows[r][c]
                 and rows[k][c] != ""
-                and all(span[k][cc] == 0 for cc in range(c))  # outer cells still merged
+                and all(span[k][cc] == 0 for cc in gate)  # required parents still merged
             ):
                 k += 1
             span[r][c] = k - r
@@ -1022,7 +1051,9 @@ def _merge_runs(rows: list[list[str]], n_merge: int) -> list[list[int]]:
     return span
 
 
-def _merged_html(disp: pd.DataFrame, merge_cols: list[str], freeze: int) -> str:
+def _merged_html(
+    disp: pd.DataFrame, merge_cols: list[str], freeze: int, max_height: int = 620
+) -> str:
     """A real merged-cell table (HTML rowspan), like Excel's Merge & Center.
     Streamlit's grid cannot merge cells, so the merged view is rendered as HTML."""
     cols = list(disp.columns)
@@ -1033,17 +1064,20 @@ def _merged_html(disp: pd.DataFrame, merge_cols: list[str], freeze: int) -> str:
     reord = merge_idx + [i for i in range(len(cols)) if i not in merge_idx]
     rows = [[r[i] for i in reord] for r in body]
     hdr = [cols[i] for i in reord]
-    span = _merge_runs(rows, n_merge)
+    span = _merge_runs(rows, n_merge, _merge_parents(hdr[:n_merge]))
 
-    css = """<style>
-    .mtbl{border-collapse:collapse;font-size:13px;width:max-content}
-    .mtbl th,.mtbl td{border:1px solid #d9d9d9;padding:5px 9px;vertical-align:middle}
-    .mtbl th{background:#f2f2f2;position:sticky;top:0;z-index:3;text-align:left}
-    .mtbl td.k{background:#fbfbfb;font-weight:500}
-    .mtbl .stick{position:sticky;background:#fff;z-index:2}
-    .mtbl th.stick{z-index:4;background:#f2f2f2}
-    .mwrap{overflow:auto;max-height:620px;border:1px solid #e6e6e6;border-radius:6px}
-    </style>"""
+    css = (
+        "<style>"
+        ".mtbl{border-collapse:collapse;font-size:13px;width:max-content}"
+        ".mtbl th,.mtbl td{border:1px solid #d9d9d9;padding:5px 9px;vertical-align:middle}"
+        ".mtbl th{background:#f2f2f2;position:sticky;top:0;z-index:3;text-align:left}"
+        ".mtbl td.k{background:#fbfbfb;font-weight:500}"
+        ".mtbl .stick{position:sticky;background:#fff;z-index:2}"
+        ".mtbl th.stick{z-index:4;background:#f2f2f2}"
+        ".mwrap{overflow:auto;max-height:" + str(max_height) + "px;"
+        "border:1px solid #e6e6e6;border-radius:6px}"
+        "</style>"
+    )
 
     # sticky left offsets for the frozen columns
     widths = [220 if i < n_merge else 150 for i in range(len(hdr))]
@@ -1178,8 +1212,43 @@ def show_df(
     # ---- MERGED (read-only, real spanning cells) ------------------------------
     if merge:
         body = disp.drop(columns=["✓", "__rid__"])
+        # The merged view is custom HTML, so Streamlit's built-in grid toolbar
+        # (show/hide columns, full screen, download) is not attached to it. Provide
+        # the same essentials here so they don't disappear when merging is on.
+        mctl1, mctl2, mctl3 = st.columns([2.4, 1.0, 1.1])
+        with mctl1:
+            hideable = [c for c in body.columns if c not in merge_cols]
+            hidden = st.multiselect(
+                "Hide columns",
+                hideable,
+                key=f"mhide::{table_key}",
+                help="Hide experiment columns from the merged view (the key columns "
+                "that drive the merges always stay visible).",
+            )
+        with mctl2:
+            full = st.checkbox(
+                "Full screen",
+                key=f"mfull::{table_key}",
+                help="Expand the merged table to (almost) the full window height.",
+            )
+        shown = [c for c in body.columns if c not in set(hidden)]
+        body = body[shown]
+        with mctl3:
+            st.download_button(
+                "Download CSV",
+                data=body.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"{table_key.replace('::', '_')}.csv",
+                mime="text/csv",
+                key=f"mcsv::{table_key}",
+                use_container_width=True,
+            )
         st.markdown(
-            _merged_html(body, [c for c in merge_cols if c in body.columns], int(freeze)),
+            _merged_html(
+                body,
+                [c for c in merge_cols if c in body.columns],
+                int(freeze),
+                max_height=880 if full else 620,
+            ),
             unsafe_allow_html=True,
         )
         st.caption(
@@ -1661,6 +1730,33 @@ def results_long_df(records: list[dict]) -> pd.DataFrame:
     return df
 
 
+def _agg_cell(values, mode: str) -> str:
+    """Combine several measurements that land in one (property x experiment) cell.
+
+    mode 'avg' -> numeric mean of the measurements (e.g. 6.12, 6.65, 5.71 -> 6.16),
+                  formatted to the same number of decimals as the inputs; falls back
+                  to listing when the values are not all numeric.
+    otherwise  -> the distinct values joined with ' | ' (original behaviour)."""
+    vals = [str(x) for x in values if str(x) != ""]
+    if not vals:
+        return ""
+    if mode == "avg":
+        nums = []
+        for x in vals:
+            try:
+                nums.append(float(x.replace(",", ".")))
+            except ValueError:
+                nums = []
+                break  # non-numeric column -> list instead of averaging
+        if nums:
+            m = sum(nums) / len(nums)
+            # keep as many decimals as the inputs carry (handles 6,12 and 6.12)
+            decs = [len(x.replace(",", ".").split(".", 1)[1]) for x in vals if ("." in x or "," in x)]
+            dec = min(max(decs, default=0), 6)
+            return f"{m:.{dec}f}"
+    return " | ".join(dict.fromkeys(vals))
+
+
 def results_drilldown_df(records: list[dict], include_foreign: bool = False) -> pd.DataFrame:
     """Pivot: DT | DC | Unit | I1 | I2 | Trial rows x visible experiment cols.
     `include_foreign` also shows inventory items filtered out or belonging to
@@ -1668,6 +1764,7 @@ def results_drilldown_df(records: list[dict], include_foreign: bool = False) -> 
     long = results_long_df(records)
     if long.empty:
         return pd.DataFrame()
+    agg_mode = st.session_state.get("results_agg_mode", "list")
 
     tuple_of = dict(invid_to_tuple)
     extra_cols: list[tuple[str, str]] = []
@@ -1680,7 +1777,7 @@ def results_drilldown_df(records: list[dict], include_foreign: bool = False) -> 
 
     g = (
         long.groupby(RESULT_KEYS + ["inventory_id"], dropna=False, sort=False)["value"]
-        .apply(lambda v: " | ".join(dict.fromkeys(str(x) for x in v if x != "")))
+        .apply(lambda v: _agg_cell(v, agg_mode))
         .reset_index()
     )
     recs = []
@@ -1764,6 +1861,17 @@ for s in sections:
         )
     with r2:
         long_view = st.checkbox("Long (tidy) view instead of pivot", value=False)
+
+    agg_choice = st.radio(
+        "Repeated measurements per property",
+        ["List all values (6.12 | 6.65 | 5.71)", "Average"],
+        horizontal=True,
+        key=f"agg::{s['attr']}",
+        help="When one property has several measurements for the same experiment, "
+        "either list every value or show their numeric average. Applies to the pivot "
+        "view on screen and to the XLSX / CSV (pivot) downloads.",
+    )
+    st.session_state["results_agg_mode"] = "avg" if agg_choice == "Average" else "list"
 
     loaded = load_selected_results(client, project_id)
     task_names = {t["id"]: t["name"] for t in property_tasks}
@@ -1932,7 +2040,7 @@ def build_xlsx() -> bytes:
         idxs = [keys.index(m) for m in merge_cols if m in keys]
         if keymat and idxs:
             ordered = [[row[i] for i in idxs] for row in keymat]
-            spans = _merge_runs(ordered, len(idxs))
+            spans = _merge_runs(ordered, len(idxs), _merge_parents([keys[i] for i in idxs]))
             for rr in range(len(keymat)):
                 for cc, col_i in enumerate(idxs):
                     s = spans[rr][cc]
@@ -1996,7 +2104,10 @@ def build_xlsx() -> bytes:
                 )
                 if not rdf.empty
                 else iter(()),
-                merge_cols=RESULT_KEYS,  # Data Template / Column / Unit / Intervals / Trial
+                # Property Task is the outermost key: merge it too, so its cells span
+                # all the rows of one task (Data Template / Column / Unit / Intervals /
+                # Trial then merge within each Property Task, Excel-style).
+                merge_cols=["Property Task"] + RESULT_KEYS,
             )
 
     # --- widths ---------------------------------------------------------------

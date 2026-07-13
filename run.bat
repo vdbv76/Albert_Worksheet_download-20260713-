@@ -55,10 +55,14 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM --- Make sure Streamlit (and the rest) are installed -----------------------
-%PY% -c "import streamlit" >nul 2>nul
+REM --- Make sure ALL requirements are installed ------------------------------
+REM  Check every dependency, not just streamlit: this machine already had
+REM  streamlit but was missing truststore, so a streamlit-only check would
+REM  wrongly skip installation. find_spec avoids actually importing (fast, no
+REM  side effects) and returns non-zero if ANY package is missing.
+%PY% -c "import importlib.util as u, sys; sys.exit(1 if any(u.find_spec(m) is None for m in ['streamlit','albert','pandas','truststore','openpyxl']) else 0)" >nul 2>nul
 if errorlevel 1 (
-    echo Streamlit not found - installing dependencies from requirements.txt ...
+    echo Some dependencies are missing - installing from requirements.txt ...
     %PY% -m pip install --upgrade pip
     %PY% -m pip install -r requirements.txt
     if errorlevel 1 (
