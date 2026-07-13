@@ -1420,6 +1420,9 @@ def show_df(
         desc = next((d for code, d in col_tuples if code == c), None)
         cfg[c] = st.column_config.Column(label=c, help=desc or None, pinned=i <= freeze)
 
+    # Only pass an explicit height for the full-screen view; omitting it lets the
+    # grid auto-size (passing height=None raises on some Streamlit versions).
+    editor_kwargs: dict[str, Any] = {"height": 800} if full else {}
     edited = st.data_editor(
         disp,
         use_container_width=True,
@@ -1427,8 +1430,8 @@ def show_df(
         column_config=cfg,
         column_order=ordered,
         disabled=[c for c in ordered if c != "✓"],
-        height=800 if full else None,
         key=f"ed::{table_key}",
+        **editor_kwargs,
     )
 
     # persist ticks (ignore the synthetic description row)
