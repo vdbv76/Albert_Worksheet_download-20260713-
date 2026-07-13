@@ -997,14 +997,43 @@ def rows_dataframe(section: dict, row_filter: dict | None = None, with_ids: bool
     return (df, rids) if with_ids else df
 
 
-def _merge_runs(rows: list[list[str]], n_merge: int) -> list[list[int]]:
+def _merge_parents(names: list[str]) -> list[list[int]]:
+    """Which already-merged columns each merge column depends on (its 'parents').
+
+    Default hierarchy is strictly left-to-right, BUT interval columns are special:
+    a time point (Interval 1/2) repeats across every property measured at it, so
+    gating it behind Data Column / Unit would keep it from merging on a multi-
+    property task. Instead an interval merges on its own repeated values, gated
+    only by the OUTERMOST key (Data Template / Property Task) and any interval
+    column to its left - so it still respects the top-level block boundary but
+    spans across the different properties inside one block."""
+    parents: list[list[int]] = []
+    nonint: list[int] = []
+    inte: list[int] = []
+    for i, nm in enumerate(names):
+        if str(nm).startswith("Interval "):
+            parents.append(([nonint[0]] if nonint else []) + inte[:])
+            inte.append(i)
+        else:
+            parents.append(list(nonint))
+            nonint.append(i)
+    return parents
+
+
+def _merge_runs(
+    rows: list[list[str]], n_merge: int, parents: list[list[int]] | None = None
+) -> list[list[int]]:
     """For the first n_merge columns, compute the rowspan of each cell.
     span[r][c] = number of rows this cell spans (0 = absorbed by the cell above).
-    A change in an OUTER column always breaks the run in the inner ones, so
-    'Cobb Value' under a new Data Template starts a fresh merge."""
+    `parents[c]` lists the columns that must still be merged for column c to keep
+    a run going; when omitted it is every column to the left (a plain hierarchy),
+    so 'Cobb Value' under a new Data Template starts a fresh merge."""
     n = len(rows)
     span = [[1] * n_merge for _ in range(n)]
+    if parents is None:
+        parents = [list(range(c)) for c in range(n_merge)]
     for c in range(n_merge):
+        gate = parents[c]
         r = 0
         while r < n:
             k = r + 1
@@ -1012,7 +1041,7 @@ def _merge_runs(rows: list[list[str]], n_merge: int) -> list[list[int]]:
                 k < n
                 and rows[k][c] == rows[r][c]
                 and rows[k][c] != ""
-                and all(span[k][cc] == 0 for cc in range(c))  # outer cells still merged
+                and all(span[k][cc] == 0 for cc in gate)  # required parents still merged
             ):
                 k += 1
             span[r][c] = k - r
@@ -1035,7 +1064,7 @@ def _merged_html(
     reord = merge_idx + [i for i in range(len(cols)) if i not in merge_idx]
     rows = [[r[i] for i in reord] for r in body]
     hdr = [cols[i] for i in reord]
-    span = _merge_runs(rows, n_merge)
+    span = _merge_runs(rows, n_merge, _merge_parents(hdr[:n_merge]))
 
     css = (
         "<style>"
@@ -2011,7 +2040,7 @@ def build_xlsx() -> bytes:
         idxs = [keys.index(m) for m in merge_cols if m in keys]
         if keymat and idxs:
             ordered = [[row[i] for i in idxs] for row in keymat]
-            spans = _merge_runs(ordered, len(idxs))
+            spans = _merge_runs(ordered, len(idxs), _merge_parents([keys[i] for i in idxs]))
             for rr in range(len(keymat)):
                 for cc, col_i in enumerate(idxs):
                     s = spans[rr][cc]
