@@ -124,6 +124,85 @@ def _strip_inv(row_link_id: str | None) -> str:
     return row_link_id[3:] if row_link_id.startswith("INV") else row_link_id
 
 
+def _to_number(x: Any) -> tuple[Any, bool]:
+    """(float, True) when x parses as a number (comma OR dot decimal), else (x, False)."""
+    try:
+        return float(str(x).strip().replace(",", ".")), True
+    except (ValueError, AttributeError):
+        return x, False
+
+
+def _cmp_pass(value: Any, mode: str, a: Any, b: Any = None) -> bool:
+    """Generic column filter (Product-Design Name, Results Data Column).
+    Compares numerically when both sides parse as numbers, lexicographically
+    otherwise. mode is one of All / Contains / > / < / Between."""
+    if mode in (None, "", "All"):
+        return True
+    if a in (None, ""):
+        return True
+    v = str(value)
+    if mode == "Contains":
+        return str(a).lower() in v.lower()
+    va, vnum = _to_number(v)
+    aa, anum = _to_number(a)
+    if mode == ">":
+        return (va > aa) if (vnum and anum) else (v > str(a))
+    if mode == "<":
+        return (va < aa) if (vnum and anum) else (v < str(a))
+    if mode == "Between":
+        if b in (None, ""):
+            return True
+        bb, bnum = _to_number(b)
+        if vnum and anum and bnum:
+            lo, hi = (aa, bb) if aa <= bb else (bb, aa)
+            return lo <= va <= hi
+        lo, hi = (str(a), str(b)) if str(a) <= str(b) else (str(b), str(a))
+        return lo <= v <= hi
+    return True
+
+
+def _round_sig_decimals(tok: str, decimals: int) -> str:
+    """Round ONE numeric token keeping `decimals` significant fractional digits,
+    counted from the first non-zero decimal place:
+        0.0012345 -> 0.0012   (decimals=2)
+        1.0123    -> 1.012
+        1.123     -> 1.12
+    Integers and non-numeric tokens are returned unchanged."""
+    t = tok.strip()
+    if t == "":
+        return tok
+    comma = "," in t and "." not in t
+    norm = t.replace(",", ".") if comma else t
+    try:
+        val = float(norm)
+    except ValueError:
+        return tok
+    if "." not in norm:  # an integer -> leave it alone
+        return tok
+    frac = norm.split(".", 1)[1]
+    lz = 0
+    for ch in frac:
+        if ch == "0":
+            lz += 1
+        else:
+            break
+    out = f"{val:.{lz + decimals}f}"
+    return out.replace(".", ",") if comma else out
+
+
+def _apply_decimals_text(text: Any, decimals: int | None) -> Any:
+    """Apply `_round_sig_decimals` to every numeric token in a cell, preserving the
+    ' | ' separators used to list repeated measurements."""
+    if decimals is None:
+        return text
+    s = str(text)
+    if s == "":
+        return s
+    if "|" not in s:
+        return _round_sig_decimals(s, decimals)
+    return " | ".join(_round_sig_decimals(p.strip(), decimals) for p in s.split("|"))
+
+
 # ===========================================================================
 # Sidebar: authentication
 # ===========================================================================
@@ -909,13 +988,21 @@ invid_to_tuple = {
 # ===========================================================================
 st.header("3️⃣ Worksheet")
 
+# Group / Subgroup columns are always built now; they can be hidden per-table via
+# each table's "Hide columns" dropdown instead of a single global toggle.
+show_hier_cols = True
+
 o1, o2, o3, o4 = st.columns(4)
 with o1:
-    show_hier_cols = st.checkbox(
-        "Show Group / Subgroup columns",
-        value=True,
-        help="Group, Subgroup 1 ... Subgroup n - the row's full ancestor chain.",
+    dec_choice = st.selectbox(
+        "Decimals",
+        ["All"] + list(range(0, 7)),
+        index=0,
+        help="Round numbers to this many significant decimals, counted from the first "
+        "non-zero decimal place. e.g. Decimals=2 turns 0.0012345 -> 0.0012, "
+        "1.0123 -> 1.012 and 1.123 -> 1.12. 'All' leaves numbers untouched.",
     )
+    DECIMALS = None if dec_choice == "All" else int(dec_choice)
 with o2:
     show_type_col = st.checkbox("Show 'Row type' column", value=False)
 with o3:
@@ -968,7 +1055,33 @@ def _row_in_filter(r: dict, row_filter: dict[int, list[str]]) -> bool:
     return True
 
 
-def rows_dataframe(section: dict, row_filter: dict | None = None, with_ids: bool = False):
+def _cmp_filter_widget(label: str, key: str, help_txt: str = "") -> tuple[str, str, str]:
+    """Render a compact 'column filter' (mode + up to two values) and return
+    (mode, a, b). Used by the Product-Design Name and Results Data Column filters."""
+    cols = st.columns([1.4, 1, 1])
+    with cols[0]:
+        mode = st.selectbox(
+            label,
+            ["All", "Contains", ">", "<", "Between"],
+            key=f"{key}::mode",
+            help=help_txt or None,
+        )
+    a = b = ""
+    if mode != "All":
+        with cols[1]:
+            a = st.text_input("From" if mode == "Between" else "Value", key=f"{key}::a")
+    if mode == "Between":
+        with cols[2]:
+            b = st.text_input("To", key=f"{key}::b")
+    return mode, a, b
+
+
+def rows_dataframe(
+    section: dict,
+    row_filter: dict | None = None,
+    with_ids: bool = False,
+    name_cmp: tuple[str, str, str] | None = None,
+):
     hcols = hier_cols_for(section)
     kcols = key_cols_for(section)
     recs, rids = [], []
@@ -976,6 +1089,8 @@ def rows_dataframe(section: dict, row_filter: dict | None = None, with_ids: bool
         if hide_blk and r["type_raw"].split(".")[-1] == "BLK":
             continue
         if row_filter and not _row_in_filter(r, row_filter):
+            continue
+        if name_cmp and not _cmp_pass(r["name"], *name_cmp):
             continue
         vals = {c["inventory_id"]: r["values"].get(c["inventory_id"], "") for c in visible_cols}
         if focus_view and not any(v != "" for v in vals.values()):
@@ -1052,7 +1167,12 @@ def _merge_runs(
 
 
 def _merged_html(
-    disp: pd.DataFrame, merge_cols: list[str], freeze: int, max_height: int = 620
+    disp: pd.DataFrame,
+    merge_cols: list[str],
+    freeze: int,
+    max_height: int = 620,
+    key_width: int = 220,
+    data_width: int = 150,
 ) -> str:
     """A real merged-cell table (HTML rowspan), like Excel's Merge & Center.
     Streamlit's grid cannot merge cells, so the merged view is rendered as HTML."""
@@ -1068,8 +1188,11 @@ def _merged_html(
 
     css = (
         "<style>"
-        ".mtbl{border-collapse:collapse;font-size:13px;width:max-content}"
-        ".mtbl th,.mtbl td{border:1px solid #d9d9d9;padding:5px 9px;vertical-align:middle}"
+        # table-layout:fixed makes the colgroup widths authoritative, so the width
+        # controls can BOTH grow and shrink a column (max-content only ever grew).
+        ".mtbl{border-collapse:collapse;font-size:13px;table-layout:fixed}"
+        ".mtbl th,.mtbl td{border:1px solid #d9d9d9;padding:5px 9px;vertical-align:middle;"
+        "overflow:hidden;word-break:break-word}"
         ".mtbl th{background:#f2f2f2;position:sticky;top:0;z-index:3;text-align:left}"
         ".mtbl td.k{background:#fbfbfb;font-weight:500}"
         ".mtbl .stick{position:sticky;background:#fff;z-index:2}"
@@ -1079,8 +1202,9 @@ def _merged_html(
         "</style>"
     )
 
-    # sticky left offsets for the frozen columns
-    widths = [220 if i < n_merge else 150 for i in range(len(hdr))]
+    # sticky left offsets for the frozen columns; column widths are user-adjustable
+    widths = [key_width if i < n_merge else data_width for i in range(len(hdr))]
+    total_w = sum(widths)
     offs, acc = [], 0
     for w in widths:
         offs.append(acc)
@@ -1092,7 +1216,14 @@ def _merged_html(
     def sty(i):
         return f' style="left:{offs[i]}px;min-width:{widths[i]}px"' if i < freeze else ""
 
-    h = [css, '<div class="mwrap"><table class="mtbl"><thead><tr>']
+    h = [css, f'<div class="mwrap"><table class="mtbl" style="width:{total_w}px">']
+    # <colgroup> sets an explicit width for every column so the width controls take
+    # effect even for the non-frozen columns (which get no per-cell min-width).
+    h.append("<colgroup>")
+    for w in widths:
+        h.append(f'<col style="width:{w}px;min-width:{w}px">')
+    h.append("</colgroup>")
+    h.append("<thead><tr>")
     for i, c in enumerate(hdr):
         h.append(f'<th class="{cls(i).strip()}"{sty(i)}>{c}</th>')
     h.append("</tr></thead><tbody>")
@@ -1142,28 +1273,27 @@ def show_df(
         sel.setdefault(rid, True)
 
     # ---- controls -----------------------------------------------------------
-    c1, c2, c3, c4, c5, c6 = st.columns([1.1, 1.2, 1.3, 1.0, 1.4, 1.3])
-    with c1:
+    # The three row-selection buttons are kept tight together on the left; the
+    # view controls (freeze / merge / hide / full screen) follow after a gap.
+    b1, b2, b3, _gap, c_fz, c_mg, c_hide, c_full = st.columns(
+        [1, 1, 1, 0.4, 1.3, 1.0, 2.0, 0.9]
+    )
+    with b1:
         if st.button("Select all", key=f"sa::{table_key}"):
             for rid in row_ids:
                 sel[rid] = True
+            st.session_state[applied_key] = False  # bring every row back into view
             st.rerun()
-    with c2:
+    with b2:
         if st.button("Unselect all", key=f"ua::{table_key}"):
             for rid in row_ids:
                 sel[rid] = False
             st.rerun()
-    with c3:
+    with b3:
         if st.button("Apply selection", key=f"ap::{table_key}", type="primary"):
             st.session_state[applied_key] = True
             st.rerun()
-    with c4:
-        if st.button("Original", key=f"or::{table_key}"):
-            st.session_state[applied_key] = False
-            for rid in row_ids:
-                sel[rid] = True
-            st.rerun()
-    with c5:
+    with c_fz:
         freeze = st.number_input(
             "Freeze columns",
             min_value=0,
@@ -1173,7 +1303,7 @@ def show_df(
             key=f"fz::{table_key}",
             help="How many columns stay pinned on the left while you scroll sideways.",
         )
-    with c6:
+    with c_mg:
         merge = st.checkbox(
             "Merge cells",
             value=False,
@@ -1182,6 +1312,25 @@ def show_df(
             "cell (Excel-style). The merged view is read-only - untick to edit the "
             "row selection.",
         )
+    # 'Hide columns' and 'Full screen' now apply in BOTH the interactive and the
+    # merged views. The dropdown lists EVERY column - the key columns (Group /
+    # Subgroup / Name / ...) as well as the experiment columns - so any of them can
+    # be hidden.
+    hideable = list(key_labels) + [t[0] for t in col_tuples]
+    with c_hide:
+        hidden_cols = st.multiselect(
+            "Hide columns",
+            hideable,
+            key=f"hide::{table_key}",
+            help="Hide any column from this table (key columns included).",
+        )
+    with c_full:
+        full = st.checkbox(
+            "Full screen",
+            key=f"full::{table_key}",
+            help="Expand this table to (almost) the full window height.",
+        )
+    hidden_set = set(hidden_cols)
 
     applied = st.session_state.get(applied_key, False)
 
@@ -1196,7 +1345,7 @@ def show_df(
     if applied:
         disp = disp[disp["✓"]]
         if disp.empty:
-            st.warning("No rows selected. Press **Original** to bring them all back.")
+            st.warning("No rows selected. Press **Select all** to bring them all back.")
             return
 
     if show_desc_row and col_tuples:
@@ -1209,38 +1358,38 @@ def show_df(
                 head[code] = desc
         disp = pd.concat([pd.DataFrame([head]), disp], ignore_index=True)
 
+    # ---- decimals: round the experiment (value) columns for display ----------
+    if DECIMALS is not None:
+        for _code, _ in col_tuples:
+            if _code in disp.columns:
+                disp[_code] = disp[_code].map(lambda x: _apply_decimals_text(x, DECIMALS))
+
     # ---- MERGED (read-only, real spanning cells) ------------------------------
     if merge:
         body = disp.drop(columns=["✓", "__rid__"])
-        # The merged view is custom HTML, so Streamlit's built-in grid toolbar
-        # (show/hide columns, full screen, download) is not attached to it. Provide
-        # the same essentials here so they don't disappear when merging is on.
-        mctl1, mctl2, mctl3 = st.columns([2.4, 1.0, 1.1])
-        with mctl1:
-            hideable = [c for c in body.columns if c not in merge_cols]
-            hidden = st.multiselect(
-                "Hide columns",
-                hideable,
-                key=f"mhide::{table_key}",
-                help="Hide experiment columns from the merged view (the key columns "
-                "that drive the merges always stay visible).",
-            )
-        with mctl2:
-            full = st.checkbox(
-                "Full screen",
-                key=f"mfull::{table_key}",
-                help="Expand the merged table to (almost) the full window height.",
-            )
-        shown = [c for c in body.columns if c not in set(hidden)]
+        shown = [c for c in body.columns if c not in hidden_set]
         body = body[shown]
-        with mctl3:
-            st.download_button(
-                "Download CSV",
-                data=body.to_csv(index=False).encode("utf-8-sig"),
-                file_name=f"{table_key.replace('::', '_')}.csv",
-                mime="text/csv",
-                key=f"mcsv::{table_key}",
-                use_container_width=True,
+        # Column widths are adjustable in the merged view.
+        w1, w2 = st.columns(2)
+        with w1:
+            key_w = st.number_input(
+                "Key column width (px)",
+                min_value=60,
+                max_value=600,
+                value=220,
+                step=10,
+                key=f"kw::{table_key}",
+                help="Width of the merged key columns (Group / Subgroup / Name / ...).",
+            )
+        with w2:
+            dat_w = st.number_input(
+                "Data column width (px)",
+                min_value=50,
+                max_value=400,
+                value=150,
+                step=10,
+                key=f"dw::{table_key}",
+                help="Width of the experiment (value) columns.",
             )
         st.markdown(
             _merged_html(
@@ -1248,6 +1397,8 @@ def show_df(
                 [c for c in merge_cols if c in body.columns],
                 int(freeze),
                 max_height=880 if full else 620,
+                key_width=int(key_w),
+                data_width=int(dat_w),
             ),
             unsafe_allow_html=True,
         )
@@ -1258,14 +1409,14 @@ def show_df(
         return
 
     # ---- INTERACTIVE (checkboxes + pinned columns) ---------------------------
-    ordered = [c for c in disp.columns if c != "__rid__"]
+    ordered = [c for c in disp.columns if c != "__rid__" and c not in hidden_set]
     cfg: dict[str, Any] = {
         "✓": st.column_config.CheckboxColumn(
             "", help="Tick the rows to keep, then press Apply selection.", pinned=True
         ),
         "__rid__": None,  # hidden
     }
-    for i, c in enumerate(ordered[1:], start=1):  # column 0 is the checkbox
+    for i, c in enumerate([x for x in ordered if x != "✓"], start=1):
         desc = next((d for code, d in col_tuples if code == c), None)
         cfg[c] = st.column_config.Column(label=c, help=desc or None, pinned=i <= freeze)
 
@@ -1276,6 +1427,7 @@ def show_df(
         column_config=cfg,
         column_order=ordered,
         disabled=[c for c in ordered if c != "✓"],
+        height=800 if full else None,
         key=f"ed::{table_key}",
     )
 
@@ -1731,6 +1883,16 @@ def results_long_df(records: list[dict]) -> pd.DataFrame:
         lambda i: (invid_to_tuple.get(i) or ("", ""))[1]
     )
     df["Visible (passes filters)"] = df["inventory_id"].isin(invid_to_tuple)
+
+    # Results-only row filters (Data Column comparison + Interval selection).
+    dc_f = st.session_state.get("res_dc_filter")
+    if dc_f and dc_f[0] != "All":
+        df = df[df["Data Column"].map(lambda x: _cmp_pass(x, *dc_f))]
+    iv_sel = st.session_state.get("res_interval_filter") or []
+    if iv_sel:
+        icols = [c for c in df.columns if str(c).startswith("Interval ")]
+        if icols:
+            df = df[df[icols].apply(lambda row: any(str(v) in iv_sel for v in row), axis=1)]
     return df
 
 
@@ -1861,7 +2023,17 @@ for s in sections:
                         help=f"'{NONE_LABEL}' = rows with no {hc.lower()}.",
                     )
 
-        sdf, srids = rows_dataframe(s, row_filter, with_ids=True)
+        # --- Product Design: Name filter (>, <, range or contains) -----------
+        name_cmp = None
+        if s["attr"] == "product_design":
+            name_cmp = _cmp_filter_widget(
+                "Name filter",
+                key=f"namefilter::{s['attr']}",
+                help_txt="Filter Product Design rows by their Name "
+                "(>, <, Between range, or Contains).",
+            )
+
+        sdf, srids = rows_dataframe(s, row_filter, with_ids=True, name_cmp=name_cmp)
         show_df(sdf, key_cols_for(s), table_key=f"sec::{s['attr']}", row_ids=srids)
         continue
 
@@ -1900,6 +2072,34 @@ for s in sections:
         "Data Template + Data Column + Interval (regardless of which block it came "
         "from). The XLSX export shows the same single table, with the experiment "
         "columns aligned to the Product Design columns.",
+    )
+
+    # --- Results-only filters: Data Column (>, <, range) + Interval ----------
+    _recs_for_opts = _loaded_records()
+    if _recs_for_opts:
+        resolve_intervals(_recs_for_opts)
+    iv_options = sorted(
+        {
+            str(r.get(k))
+            for r in _recs_for_opts
+            for k in list(r.keys())
+            if str(k).startswith("Interval ") and str(r.get(k)).strip()
+        }
+    )
+    st.markdown("**Results filters**")
+    st.session_state["res_dc_filter"] = _cmp_filter_widget(
+        "Data Column filter",
+        key="res_dc",
+        help_txt="Filter Results rows by their Data Column (>, <, Between range, or Contains).",
+    )
+    st.session_state["res_interval_filter"] = st.multiselect(
+        "Interval",
+        iv_options,
+        key="res_interval",
+        help="Show only rows recorded at the selected interval(s). Options are the "
+        "intervals present in the loaded Property Tasks."
+        if iv_options
+        else "Load a Property Task below; its intervals will appear here.",
     )
 
     loaded = load_selected_results(client, project_id)
