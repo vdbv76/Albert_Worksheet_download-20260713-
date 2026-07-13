@@ -133,9 +133,10 @@ def _to_number(x: Any) -> tuple[Any, bool]:
 
 
 def _cmp_pass(value: Any, mode: str, a: Any, b: Any = None) -> bool:
-    """Generic column filter (Product-Design Name, Results Data Column).
+    """Generic column filter (Product-Design fields, Results Data Column).
     Compares numerically when both sides parse as numbers, lexicographically
-    otherwise. mode is one of All / Contains / > / < / Between."""
+    otherwise. mode is one of All / > / = / < / Range (Between is a Range alias;
+    Contains is still accepted for backward compatibility)."""
     if mode in (None, "", "All"):
         return True
     if a in (None, ""):
@@ -145,11 +146,13 @@ def _cmp_pass(value: Any, mode: str, a: Any, b: Any = None) -> bool:
         return str(a).lower() in v.lower()
     va, vnum = _to_number(v)
     aa, anum = _to_number(a)
+    if mode == "=":
+        return (va == aa) if (vnum and anum) else (v == str(a))
     if mode == ">":
         return (va > aa) if (vnum and anum) else (v > str(a))
     if mode == "<":
         return (va < aa) if (vnum and anum) else (v < str(a))
-    if mode == "Between":
+    if mode in ("Between", "Range"):
         if b in (None, ""):
             return True
         bb, bnum = _to_number(b)
@@ -1055,32 +1058,63 @@ def _row_in_filter(r: dict, row_filter: dict[int, list[str]]) -> bool:
     return True
 
 
-def _cmp_filter_widget(label: str, key: str, help_txt: str = "") -> tuple[str, str, str]:
-    """Render a compact 'column filter' (mode + up to two values) and return
-    (mode, a, b). Used by the Product-Design Name and Results Data Column filters."""
-    cols = st.columns([1.4, 1, 1])
-    with cols[0]:
-        mode = st.selectbox(
-            label,
-            ["All", "Contains", ">", "<", "Between"],
-            key=f"{key}::mode",
-            help=help_txt or None,
+def _cmp_filter_widget(
+    label: str,
+    key: str,
+    fields: dict[str, list[str]],
+    default_field: str,
+    help_txt: str = "",
+) -> tuple[str, str, str, str]:
+    """3-step comparison filter:
+        (1) pick a field (e.g. Name, Data Column),
+        (2) pick an operator ( > / = / < / Range ),
+        (3) pick a value (Range picks two).
+    `fields` maps each selectable field name to the sorted distinct values present
+    in it. Returns (field, mode, a, b)."""
+    field_names = list(fields.keys())
+    if not field_names:
+        return ("", "All", "", "")
+    c0, c1, c2, c3 = st.columns([1.5, 0.9, 1.3, 1.3])
+    with c0:
+        idx = field_names.index(default_field) if default_field in field_names else 0
+        field = st.selectbox(
+            label, field_names, index=idx, key=f"{key}::field", help=help_txt or None
         )
+    with c1:
+        mode = st.selectbox("Operator", ["All", ">", "=", "<", "Range"], key=f"{key}::mode")
+    vals = fields.get(field, [])
     a = b = ""
     if mode != "All":
-        with cols[1]:
-            a = st.text_input("From" if mode == "Between" else "Value", key=f"{key}::a")
-    if mode == "Between":
-        with cols[2]:
-            b = st.text_input("To", key=f"{key}::b")
-    return mode, a, b
+        with c2:
+            a = st.selectbox(
+                "From" if mode == "Range" else "Value",
+                [""] + vals,
+                key=f"{key}::a::{field}",
+            )
+    if mode == "Range":
+        with c3:
+            b = st.selectbox("To", [""] + vals, key=f"{key}::b::{field}")
+    return field, mode, a, b
+
+
+def _row_field_value(r: dict, field: str, hcols: list[str]) -> str:
+    """The value of one key field (Name / Row type / Group / Subgroup n) for a row,
+    used to evaluate the Product-Design comparison filter."""
+    if field == "Name":
+        return r["name"]
+    if field == "Row type":
+        return r["type"]
+    if field in hcols:
+        i = hcols.index(field)
+        return r["path"][i] if len(r["path"]) > i else ""
+    return ""
 
 
 def rows_dataframe(
     section: dict,
     row_filter: dict | None = None,
     with_ids: bool = False,
-    name_cmp: tuple[str, str, str] | None = None,
+    key_cmp: tuple[str, str, str, str] | None = None,
 ):
     hcols = hier_cols_for(section)
     kcols = key_cols_for(section)
@@ -1090,8 +1124,10 @@ def rows_dataframe(
             continue
         if row_filter and not _row_in_filter(r, row_filter):
             continue
-        if name_cmp and not _cmp_pass(r["name"], *name_cmp):
-            continue
+        if key_cmp:
+            _field, _mode, _a, _b = key_cmp
+            if not _cmp_pass(_row_field_value(r, _field, hcols), _mode, _a, _b):
+                continue
         vals = {c["inventory_id"]: r["values"].get(c["inventory_id"], "") for c in visible_cols}
         if focus_view and not any(v != "" for v in vals.values()):
             continue
@@ -1887,10 +1923,11 @@ def results_long_df(records: list[dict]) -> pd.DataFrame:
     )
     df["Visible (passes filters)"] = df["inventory_id"].isin(invid_to_tuple)
 
-    # Results-only row filters (Data Column comparison + Interval selection).
+    # Results-only row filters (field comparison + Interval selection).
     dc_f = st.session_state.get("res_dc_filter")
-    if dc_f and dc_f[0] != "All":
-        df = df[df["Data Column"].map(lambda x: _cmp_pass(x, *dc_f))]
+    if dc_f and dc_f[1] != "All" and dc_f[0] in df.columns:
+        _field, _mode, _a, _b = dc_f
+        df = df[df[_field].map(lambda x: _cmp_pass(x, _mode, _a, _b))]
     iv_sel = st.session_state.get("res_interval_filter") or []
     if iv_sel:
         icols = [c for c in df.columns if str(c).startswith("Interval ")]
@@ -2026,17 +2063,34 @@ for s in sections:
                         help=f"'{NONE_LABEL}' = rows with no {hc.lower()}.",
                     )
 
-        # --- Product Design: Name filter (>, <, range or contains) -----------
-        name_cmp = None
+        # --- Product Design: field filter (pick field -> operator -> value) --
+        key_cmp = None
         if s["attr"] == "product_design":
-            name_cmp = _cmp_filter_widget(
-                "Name filter",
-                key=f"namefilter::{s['attr']}",
-                help_txt="Filter Product Design rows by their Name "
-                "(>, <, Between range, or Contains).",
-            )
+            _hc = hier_cols_for(s)
+            _field_opts = ["Name"] + _hc + (["Row type"] if show_type_col else [])
+            _fields: dict[str, list[str]] = {}
+            for _f in _field_opts:
+                _vals = sorted(
+                    {
+                        _row_field_value(r, _f, _hc)
+                        for r in s["rows"]
+                        if _row_field_value(r, _f, _hc)
+                    }
+                )
+                if _vals:
+                    _fields[_f] = _vals
+            if _fields:
+                st.markdown("**Filter rows** — pick a field, an operator and a value")
+                key_cmp = _cmp_filter_widget(
+                    "Field",
+                    key=f"namefilter::{s['attr']}",
+                    fields=_fields,
+                    default_field="Name",
+                    help_txt="Filter Product Design rows: choose the column (Name, "
+                    "Group, Subgroup ...), then >, =, < or Range, then a value.",
+                )
 
-        sdf, srids = rows_dataframe(s, row_filter, with_ids=True, name_cmp=name_cmp)
+        sdf, srids = rows_dataframe(s, row_filter, with_ids=True, key_cmp=key_cmp)
         show_df(sdf, key_cols_for(s), table_key=f"sec::{s['attr']}", row_ids=srids)
         continue
 
@@ -2089,12 +2143,27 @@ for s in sections:
             if str(k).startswith("Interval ") and str(r.get(k)).strip()
         }
     )
-    st.markdown("**Results filters**")
-    st.session_state["res_dc_filter"] = _cmp_filter_widget(
-        "Data Column filter",
-        key="res_dc",
-        help_txt="Filter Results rows by their Data Column (>, <, Between range, or Contains).",
-    )
+    res_field_opts = ["Data Column", "Data Template", "Unit", "Trial"]
+    res_fields: dict[str, list[str]] = {}
+    for _f in res_field_opts:
+        _vals = sorted(
+            {str(r.get(_f, "")) for r in _recs_for_opts if str(r.get(_f, "")).strip()}
+        )
+        if _vals:
+            res_fields[_f] = _vals
+    st.markdown("**Results filters** — pick a field, an operator and a value")
+    if res_fields:
+        st.session_state["res_dc_filter"] = _cmp_filter_widget(
+            "Field",
+            key="res_dc",
+            fields=res_fields,
+            default_field="Data Column",
+            help_txt="Filter Results rows: choose the column (Data Column, Data "
+            "Template, Unit, Trial), then >, =, < or Range, then a value.",
+        )
+    else:
+        st.session_state["res_dc_filter"] = None
+        st.caption("Load a Property Task below to enable the Data Column filter.")
     st.session_state["res_interval_filter"] = st.multiselect(
         "Interval",
         iv_options,
