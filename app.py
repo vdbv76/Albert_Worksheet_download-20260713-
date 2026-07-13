@@ -1708,6 +1708,10 @@ def _loaded_records() -> list[dict]:
 N_AXES = max(2, _n_axes(_loaded_records()))
 INTERVAL_KEYS = [f"Interval {i + 1}" for i in range(N_AXES)]
 RESULT_KEYS = ["Data Template", "Data Column", "Unit"] + INTERVAL_KEYS + ["Trial"]
+# Keys for the "Merge Results by DT" view: one row per Data Template / Data Column
+# / Unit / Interval, pooled across every selected Property Block (Trial dropped, so
+# repeated trials collapse into one cell via the aggregation choice).
+MERGE_DT_KEYS = ["Data Template", "Data Column", "Unit"] + INTERVAL_KEYS
 
 
 def results_long_df(records: list[dict]) -> pd.DataFrame:
@@ -1757,10 +1761,17 @@ def _agg_cell(values, mode: str) -> str:
     return " | ".join(dict.fromkeys(vals))
 
 
-def results_drilldown_df(records: list[dict], include_foreign: bool = False) -> pd.DataFrame:
+def results_drilldown_df(
+    records: list[dict],
+    include_foreign: bool = False,
+    group_keys: list[str] | None = None,
+) -> pd.DataFrame:
     """Pivot: DT | DC | Unit | I1 | I2 | Trial rows x visible experiment cols.
     `include_foreign` also shows inventory items filtered out or belonging to
-    other sheets (dropped silently before = looked like 'no data')."""
+    other sheets (dropped silently before = looked like 'no data').
+    `group_keys` overrides the row key (e.g. MERGE_DT_KEYS drops Trial so several
+    Property Blocks pool into one row per Data Template / Column / Interval)."""
+    keys = group_keys or RESULT_KEYS
     long = results_long_df(records)
     if long.empty:
         return pd.DataFrame()
@@ -1776,13 +1787,13 @@ def results_drilldown_df(records: list[dict], include_foreign: bool = False) -> 
             tuple_of[inv] = t
 
     g = (
-        long.groupby(RESULT_KEYS + ["inventory_id"], dropna=False, sort=False)["value"]
+        long.groupby(keys + ["inventory_id"], dropna=False, sort=False)["value"]
         .apply(lambda v: _agg_cell(v, agg_mode))
         .reset_index()
     )
     recs = []
-    for kv, chunk in g.groupby(RESULT_KEYS, dropna=False, sort=False):
-        rec = dict(zip(RESULT_KEYS, kv))
+    for kv, chunk in g.groupby(keys, dropna=False, sort=False):
+        rec = dict(zip(keys, kv if isinstance(kv, tuple) else (kv,)))
         has = False
         for _, r in chunk.iterrows():
             t = tuple_of.get(r["inventory_id"])
@@ -1793,7 +1804,15 @@ def results_drilldown_df(records: list[dict], include_foreign: bool = False) -> 
             recs.append(rec)
     if not recs:
         return pd.DataFrame()
-    return pd.DataFrame(recs).reindex(columns=RESULT_KEYS + col_tuples + extra_cols).fillna("")
+    # Keep rows of the same Data Template together (the source order can interleave
+    # them, e.g. a Coating Weight row between two Cobb Value rows), so the merged
+    # Data Template cell spans them. First-appearance order and the order within a
+    # template are both preserved (Python's sort is stable).
+    dt_order: dict[str, int] = {}
+    for rec in recs:
+        dt_order.setdefault(str(rec.get("Data Template", "")), len(dt_order))
+    recs.sort(key=lambda rec: dt_order[str(rec.get("Data Template", ""))])
+    return pd.DataFrame(recs).reindex(columns=keys + col_tuples + extra_cols).fillna("")
 
 
 # ===========================================================================
@@ -1873,8 +1892,41 @@ for s in sections:
     )
     st.session_state["results_agg_mode"] = "avg" if agg_choice == "Average" else "list"
 
+    merge_by_dt = st.checkbox(
+        "Merge Results by DT",
+        value=False,
+        key="results_merge_by_dt",
+        help="Pool every selected Property Block into ONE table, with one row per "
+        "Data Template + Data Column + Interval (regardless of which block it came "
+        "from). The XLSX export shows the same single table, with the experiment "
+        "columns aligned to the Product Design columns.",
+    )
+
     loaded = load_selected_results(client, project_id)
     task_names = {t["id"]: t["name"] for t in property_tasks}
+
+    if merge_by_dt:
+        all_recs: list[dict] = []
+        for recs in loaded.values():
+            all_recs += [r for r in recs if "__error__" not in r]
+        mdf = results_drilldown_df(
+            all_recs, include_foreign=include_foreign, group_keys=MERGE_DT_KEYS
+        )
+        st.caption(
+            f"Merged view · {len(loaded)} Property Block(s) pooled into one table by "
+            "Data Template / Data Column / Interval."
+        )
+        if mdf.empty:
+            st.info(
+                "No results to merge yet. Load at least one Property Task, and check "
+                "the Data Template filter / 'Include experiments filtered out'."
+            )
+        else:
+            rids = [
+                "|".join(str(mdf.iloc[i][k]) for k in MERGE_DT_KEYS) for i in range(len(mdf))
+            ]
+            show_df(mdf, MERGE_DT_KEYS, table_key="res::merged_by_dt", row_ids=rids)
+        continue
 
     for task_id, recs in loaded.items():
         task_name = task_names.get(task_id, task_id)
@@ -1929,6 +1981,16 @@ def all_results_df() -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
+def merged_results_by_dt_df() -> pd.DataFrame:
+    """'Merge Results by DT' pooled across every loaded Property Block: one row per
+    Data Template / Data Column / Interval, experiment columns shared."""
+    store = st.session_state.get(f"results_store::v3::{project_id}", {})
+    all_recs: list[dict] = []
+    for recs in store.values():
+        all_recs += [r for r in recs if "__error__" not in r]
+    return results_drilldown_df(all_recs, include_foreign=True, group_keys=MERGE_DT_KEYS)
+
+
 def all_results_long_df() -> pd.DataFrame:
     store = st.session_state.get(f"results_store::v3::{project_id}", {})
     frames = [results_long_df(recs) for recs in store.values()]
@@ -1961,8 +2023,11 @@ def build_xlsx() -> bytes:
     from openpyxl.utils import get_column_letter
 
     # --- one key block wide enough for the widest section ---------------------
+    merge_by_dt = bool(st.session_state.get("results_merge_by_dt"))
     per_section_keys = {s["attr"]: key_cols_for(s) for s in sections}
-    per_section_keys["result_design"] = ["Property Task"] + RESULT_KEYS
+    per_section_keys["result_design"] = (
+        MERGE_DT_KEYS if merge_by_dt else ["Property Task"] + RESULT_KEYS
+    )
     KEY_W = max(len(v) for v in per_section_keys.values())
     FIRST_EXP = KEY_W + 1  # 1-based column of the first experiment
 
@@ -2090,7 +2155,9 @@ def build_xlsx() -> bytes:
                 merge_cols=[k for k in keys if k != "Name"],  # hierarchy, not the leaf
             )
         else:
-            rdf = all_results_df()
+            # 'Merge Results by DT': one pooled table (no Property Task column);
+            # otherwise the per-task table with Property Task as the outermost key.
+            rdf = merged_results_by_dt_df() if merge_by_dt else all_results_df()
             keys = per_section_keys["result_design"]
             write_section(
                 s["label"],
@@ -2104,10 +2171,9 @@ def build_xlsx() -> bytes:
                 )
                 if not rdf.empty
                 else iter(()),
-                # Property Task is the outermost key: merge it too, so its cells span
-                # all the rows of one task (Data Template / Column / Unit / Intervals /
-                # Trial then merge within each Property Task, Excel-style).
-                merge_cols=["Property Task"] + RESULT_KEYS,
+                # Merge on all key columns. Property Task (when present) is the
+                # outermost, so its cells span all the rows of one task, Excel-style.
+                merge_cols=keys,
             )
 
     # --- widths ---------------------------------------------------------------
