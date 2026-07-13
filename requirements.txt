@@ -1,0 +1,5 @@
+streamlit
+albert
+pandas
+truststore
+openpyxl
