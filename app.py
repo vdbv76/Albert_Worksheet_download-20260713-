@@ -250,50 +250,31 @@ if client is None:
 
 # ===========================================================================
 # 1) Project & sheet selection - MULTI-PROJECT COMPARISON BASKET
-#    Search is repeatable: every search only ADDS options to the Project
-#    multiselect, so earlier picks survive the next search. Selecting a
-#    project = adding it to the comparison; the chip's ✕ removes it.
+#    The Project field IS the search box: the full project catalog is loaded
+#    once (cached) and the multiselect's built-in type-ahead suggests every
+#    project whose ID or description contains what the user types ('13137',
+#    'MO13', '137', 'second', 'dispers', ...). Selecting a project = adding it
+#    to the comparison; repeat the search to add more; the chip's ✕ removes it.
 # ===========================================================================
 st.header("1️⃣ Projects & sheets")
 
-c1, c2 = st.columns([3, 1])
-with c1:
-    q = st.text_input(
-        "Search project (e.g. MO13137)",
-        help="Search as many times as you need: each search adds its matches to "
-        "the Project list below, and the projects you already selected stay "
-        "selected. That is how you build a multi-project comparison.",
-    )
-with c2:
-    only_mine = st.checkbox("Only my projects")
+PROJECT_CATALOG_MAX = 5000
 
-if st.button("🔎 Search"):
-    try:
-        with st.spinner("Searching..."):
-            found = list(
-                client.projects.search(
-                    text=q or None,
-                    my_project=True if only_mine else None,
-                    max_items=50,
-                )
-            )
-        st.session_state["projects"] = found
-        if not found:
-            st.info("No projects matched this search - previous picks are kept.")
-    except Exception as e:  # noqa: BLE001
-        st.error(f"Search failed: {e}")
 
-# The PROJECT CATALOG accumulates every project any search has returned this
-# session (label -> id). It is what lets the Project multiselect keep showing
-# (and keep selected) projects found by EARLIER searches after a new search
-# replaces st.session_state["projects"].
-proj_catalog: dict[str, str] = st.session_state.setdefault("proj_catalog", {})
-for p in st.session_state.get("projects", []):
-    proj_catalog[f"{p.description}  [{p.id}]"] = p.id
-
-if not proj_catalog:
-    st.info("Search for a project above to get started.")
-    st.stop()
+@st.cache_data(ttl=600, show_spinner="Loading the project list from Albert...")
+def load_project_catalog(_client: Albert, only_mine: bool) -> dict[str, str]:
+    """label -> project id for the Project type-ahead. The label carries BOTH
+    the description and the id ('<description>  [<id>]'), so typing any part
+    of either filters the dropdown. `only_mine` maps to the search API's
+    my_project flag (projects where the user is a member). Cached for 10 min
+    per flag value."""
+    out: dict[str, str] = {}
+    for p in _client.projects.search(
+        my_project=True if only_mine else None,
+        max_items=PROJECT_CATALOG_MAX,
+    ):
+        out[f"{p.description or '(no description)'}  [{p.id}]"] = p.id
+    return out
 
 
 def _proj_short(label: str, pid: str) -> str:
@@ -307,19 +288,60 @@ def _proj_short(label: str, pid: str) -> str:
     return desc[:20] or pid
 
 
-# Same plain-key persistence pattern as the Results task picker below: a
-# widget key alone would be garbage-collected by any st.rerun() that aborts
-# the script before this widget runs, wiping the basket.
-_prev_proj = [l for l in st.session_state.get("proj_basket", []) if l in proj_catalog]
-sel_proj_labels = st.multiselect(
-    "Project",
-    list(proj_catalog.keys()),
-    default=_prev_proj,
-    help="Every selected project joins the comparison. Search again above to "
-    "find and add more projects - this selection is kept. Remove a project "
-    "with the ✕ on its chip.",
-)
+pc1, pc2 = st.columns([3, 1])
+with pc2:
+    only_mine = st.checkbox(
+        "Only my projects",
+        help="Suggest only projects where you are a member.",
+    )
+
+try:
+    proj_catalog = load_project_catalog(client, only_mine)
+except Exception as e:  # noqa: BLE001
+    st.error(f"Could not load the project list: {e}")
+    st.stop()
+
+# Every label ever offered, so a project selected earlier stays resolvable
+# (and selected) even when 'Only my projects' later hides it from the catalog.
+_label_to_id: dict[str, str] = st.session_state.setdefault("proj_label_to_id", {})
+_label_to_id.update(proj_catalog)
+
+# KEYED widget + shadow copy. A stable `key` is what makes CONSECUTIVE
+# selection changes stick: the previous pattern (auto-keyed widget fed through
+# `default=`) changes the widget's identity on every rerun that follows a
+# selection change, so the very next change was silently dropped. The shadow
+# (plain session key) restores the basket if some st.rerun() ever aborts the
+# script before this widget runs (Streamlit then garbage-collects keyed
+# widget state).
+_PROJ_KEY = "proj_basket_widget"
+if _PROJ_KEY not in st.session_state:
+    st.session_state[_PROJ_KEY] = list(st.session_state.get("proj_basket", []))
+st.session_state[_PROJ_KEY] = [
+    l for l in st.session_state[_PROJ_KEY] if l in _label_to_id
+]
+_proj_options = [
+    l for l in st.session_state[_PROJ_KEY] if l not in proj_catalog
+] + list(proj_catalog)
+
+with pc1:
+    sel_proj_labels = st.multiselect(
+        "Project",
+        _proj_options,
+        key=_PROJ_KEY,
+        placeholder="Type a project ID or description to search...",
+        help="Type any part of the project ID (e.g. '13137', 'MO13', '137') or "
+        "of its description (e.g. 'second', 'dispers') - the dropdown suggests "
+        "every match. Pick one, then type again to search and add the next "
+        "project: every selected project joins the comparison. Remove one with "
+        "the ✕ on its chip.",
+    )
 st.session_state["proj_basket"] = sel_proj_labels
+
+if len(proj_catalog) >= PROJECT_CATALOG_MAX:
+    st.caption(
+        f"⚠️ Project list capped at the {PROJECT_CATALOG_MAX} most recent projects - "
+        "a project missing from the suggestions may be beyond the cap."
+    )
 
 if not sel_proj_labels:
     st.info("Select at least one project to load its worksheet.")
@@ -327,7 +349,7 @@ if not sel_proj_labels:
 
 # [(label, project_id, short_code), ...] in selection order
 selected_projects = [
-    (l, proj_catalog[l], _proj_short(l, proj_catalog[l])) for l in sel_proj_labels
+    (l, _label_to_id[l], _proj_short(l, _label_to_id[l])) for l in sel_proj_labels
 ]
 MULTI_PROJECT = len(selected_projects) > 1
 PROJECT_IDS = [pid for _, pid, _ in selected_projects]
@@ -369,9 +391,13 @@ if not sheet_entries:
 
 # Default: the FIRST sheet of a newly added project is auto-selected once, so
 # a fresh comparison shows data immediately - but a sheet the user deselects
-# afterwards stays deselected.
+# afterwards stays deselected. Keyed widget + shadow, same reasoning as the
+# Project picker above (consecutive changes + rerun-abort survival).
+_SHEET_KEY = "sheets_basket_widget"
+if _SHEET_KEY not in st.session_state:
+    st.session_state[_SHEET_KEY] = list(st.session_state.get("sheets_basket", []))
 _seeded: set[str] = st.session_state.setdefault("sheets_seeded", set())
-_prev_sheets = [l for l in st.session_state.get("sheets_basket", []) if l in sheet_entries]
+_prev_sheets = [l for l in st.session_state[_SHEET_KEY] if l in sheet_entries]
 for _plabel, _pid, _pshort in selected_projects:
     if _pid in _seeded:
         continue
@@ -379,12 +405,12 @@ for _plabel, _pid, _pshort in selected_projects:
     if _first:
         _prev_sheets.append(_first)
         _seeded.add(_pid)
-_prev_sheets = list(dict.fromkeys(_prev_sheets))
+st.session_state[_SHEET_KEY] = list(dict.fromkeys(_prev_sheets))
 
 sel_sheet_labels = st.multiselect(
     "Sheet",
     list(sheet_entries.keys()),
-    default=_prev_sheets,
+    key=_SHEET_KEY,
     help="Sheets are grouped by project (PROJECT ▸ Sheet). Select any number - "
     "the selected sheets are merged into ONE comparison worksheet below: rows "
     "with the same Group / name align on one row, and every project's "
@@ -2206,20 +2232,24 @@ def load_selected_results(_client: Albert) -> dict[str, list[dict]]:
         return store
 
     label_of = {f"{t['project']} ▸ {t['name']}  [{t['id']}]": t for t in tasks}
-    # Persist the selection in a PLAIN (non-widget) session_state key, and feed it
-    # back through `default`. A widget `key` alone is NOT enough here: the Advanced
-    # filter's "Add new filter" / "Apply filter" / "Remove" buttons call st.rerun(),
-    # which aborts the script BEFORE this multiselect (rendered lower down) runs.
-    # Streamlit garbage-collects the state of any widget not instantiated during a
-    # run, so a keyed selection is wiped on that aborted run and the Results table
-    # vanished until the task was re-picked. A plain key survives the rerun and
-    # restores the selection on the next full run.
+    # KEYED widget + a PLAIN shadow key. The stable `key` makes consecutive
+    # selection changes stick (feeding the value back through `default=` changes
+    # the widget's identity each rerun and silently drops the next change). The
+    # shadow restores the selection when an st.rerun() fired ABOVE this widget
+    # (Advanced-filter buttons, table buttons) aborts the script before this
+    # multiselect runs - Streamlit garbage-collects keyed state of any widget
+    # not instantiated during a run, which used to wipe the Results tables.
     persist_key = "results_tasks_persist::multi"
-    prev = [l for l in st.session_state.get(persist_key, []) if l in label_of]
+    widget_key = "results_tasks_widget"
+    if widget_key not in st.session_state:
+        st.session_state[widget_key] = list(st.session_state.get(persist_key, []))
+    st.session_state[widget_key] = [
+        l for l in st.session_state[widget_key] if l in label_of
+    ]
     selected = st.multiselect(
         f"Select the Property Tasks to load ({len(tasks)} available)",
         list(label_of.keys()),
-        default=prev,
+        key=widget_key,
         help="Grouped by project (PROJECT ▸ Task). Only the selected tasks are "
         "downloaded - one API call each. Mix tasks from different projects to "
         "compare their results side by side.",
