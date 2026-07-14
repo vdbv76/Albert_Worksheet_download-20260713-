@@ -898,33 +898,133 @@ def load_facets(_client: Albert, pid: str) -> dict[str, list[tuple[str, int]]]:
     return out
 
 
-@st.cache_data(show_spinner="Listing Property Tasks...")
-def get_property_tasks(_client: Albert, pid: str) -> list[dict]:
-    """One search call. Each TaskSearchItem already carries its data-template
-    names and inventory ids - enough for the Data-Templates filter without
-    hydrating any task."""
-    out = []
-    try:
-        for t in _client.tasks.search(project_id=pid, category="Property", max_items=500):
-            out.append(
+# ===========================================================================
+# DataTemplate-first Results: DT index built from tasks.get_all inline Blocks.
+#
+# STEP-0 SDK VERIFICATION (albert v1.34.0, via inspect/model_fields - findings):
+#   1. DT definition accessor is `client.data_templates.get_by_id(id=<DAT id>)`.
+#      The returned DataTemplate exposes `data_column_values` (alias
+#      "DataColumns"); each DataColumnValue carries `data_column_id` (alias
+#      "id"), `name`, `hidden: bool`, `sequence`, and `unit` (alias "Unit").
+#      `Unit.symbol` exists on the full Unit model, BUT the field is typed
+#      `Unit | EntityLink` - an EntityLink has no symbol - so the accessor
+#      below reads symbol defensively (symbol -> name -> "").
+#   2. `PropertyTask.blocks` (alias "Blocks") is `list[Block] | None`.
+#      `Block.workflow` (alias "Workflow") is ALWAYS a list.
+#      `Block.data_template` (alias "Datatemplate") is NOT always a list:
+#      typed `list[BlockDataTemplateInfo] | DataTemplateAndTargets |
+#      list[DataTemplate | EntityLink]` -> the `_first()` helper handles both.
+#   3. Nothing in the model forbids two blocks with the SAME dataTemplateId in
+#      one task, so the index maps DT -> list[(task, block, workflow)] - never 1:1.
+#   Also confirmed: `tasks.get_all(project_id=..., category=...)` takes a
+#   SINGULAR project_id (loop per project) and its `data_template=` filter is
+#   by NAME (not used - filtering is done client-side on DAT ids).
+# ===========================================================================
+def _first(x: Any) -> Any:
+    """Block.data_template / Block.workflow may be a list or a bare object."""
+    if isinstance(x, (list, tuple)):
+        return x[0] if x else None
+    return x
+
+
+@st.cache_data(show_spinner="Indexing Property Tasks & Data Templates...")
+def load_property_task_catalog(
+    _client: Albert, project_ids: tuple[str, ...], cache_bust: int
+) -> dict:
+    """ONE `tasks.get_all(project_id=p, category='Property')` call PER project
+    (project_id is singular). The full task objects carry an INLINE Blocks[]
+    array (block id + Datatemplate + Workflow) and the task-level Inventories[]
+    - no per-task get_by_id needed and ZERO property data downloaded.
+
+    Returns {"tasks": [...], "dt_index": {...}} where
+        dt_index[dt_id] = {"name": str,
+                           "occurrences": [{"task_id", "block_id",
+                                            "workflow_id", "project_id",
+                                            "task_name"}, ...]}
+    `cache_bust` only busts the st.cache_data entry (🔄 Reload)."""
+    tasks_out: list[dict] = []
+    dt_index: dict[str, dict] = {}
+    for pid in project_ids:
+        try:
+            found = list(
+                _client.tasks.get_all(project_id=pid, category="Property", max_items=1000)
+            )
+        except Exception as e:  # noqa: BLE001
+            st.warning(f"Task listing failed for {pid}: {e}")
+            continue
+        for t in found:
+            tid = getattr(t, "id", None)
+            tname = getattr(t, "name", "") or ""
+            if not tid:
+                continue
+            blocks_out: list[dict] = []
+            for b in getattr(t, "blocks", None) or []:
+                bid = getattr(b, "id", None)
+                dt = _first(getattr(b, "data_template", None))
+                wf = _first(getattr(b, "workflow", None))
+                dt_id = getattr(dt, "id", None)
+                dt_name = getattr(dt, "name", None) or getattr(dt, "full_name", None) or ""
+                wf_id = getattr(wf, "id", None) or ""
+                if not (bid and dt_id):
+                    continue
+                blocks_out.append(
+                    {"block_id": bid, "dt_id": dt_id, "dt_name": dt_name, "workflow_id": wf_id}
+                )
+                ent = dt_index.setdefault(dt_id, {"name": dt_name, "occurrences": []})
+                if dt_name and not ent["name"]:
+                    ent["name"] = dt_name
+                ent["occurrences"].append(
+                    {
+                        "task_id": tid,
+                        "block_id": bid,
+                        "workflow_id": wf_id,
+                        "project_id": pid,
+                        "task_name": tname,
+                    }
+                )
+            inv_ids = [
+                getattr(ii, "inventory_id", None)
+                for ii in (getattr(t, "inventory_information", None) or [])
+            ]
+            tasks_out.append(
                 {
-                    "id": t.id,
-                    "name": getattr(t, "name", "") or "",
-                    "state": getattr(t, "state", "") or "",
-                    "data_templates": [
-                        dt.name for dt in (getattr(t, "data_template", None) or []) if dt.name
-                    ],
-                    "data_template_ids": [
-                        dt.id for dt in (getattr(t, "data_template", None) or []) if dt.id
-                    ],
-                    "inventory_ids": [
-                        inv.id for inv in (getattr(t, "inventory", None) or []) if inv.id
-                    ],
+                    "id": tid,
+                    "name": tname,
+                    "state": str(getattr(t, "state", "") or ""),
+                    "project_id": pid,
+                    "data_templates": [b["dt_name"] for b in blocks_out if b["dt_name"]],
+                    "data_template_ids": [b["dt_id"] for b in blocks_out],
+                    "inventory_ids": [i for i in inv_ids if i],
+                    "blocks": blocks_out,
                 }
             )
+    return {"tasks": tasks_out, "dt_index": dt_index}
+
+
+@st.cache_data(show_spinner=False)
+def load_dt_definition(_client: Albert, dt_id: str, cache_bust: int) -> list[dict]:
+    """DataColumns of ONE Data Template, from `data_templates.get_by_id`.
+    Property data returns only `Unit.id` - the display SYMBOL exists only here,
+    so it is captured (defensively: the model allows a bare EntityLink)."""
+    out: list[dict] = []
+    try:
+        dt = _client.data_templates.get_by_id(id=dt_id)
     except Exception as e:  # noqa: BLE001
-        st.warning(f"Task search failed: {e}")
-    return out
+        st.warning(f"Could not load Data Template {dt_id}: {e}")
+        return out
+    for dcv in getattr(dt, "data_column_values", None) or []:
+        u = getattr(dcv, "unit", None)
+        out.append(
+            {
+                "id": getattr(dcv, "data_column_id", None) or "",
+                "name": getattr(dcv, "name", "") or "",
+                "hidden": bool(getattr(dcv, "hidden", False)),
+                "sequence": str(getattr(dcv, "sequence", "") or ""),
+                "unit_id": getattr(u, "id", None) or "",
+                "unit_symbol": getattr(u, "symbol", None) or getattr(u, "name", None) or "",
+            }
+        )
+    return [d for d in out if d["id"]]
 
 
 @st.cache_data(show_spinner="Resolving data template names...")
@@ -947,6 +1047,98 @@ def load_data_template_names(_client: Albert, dt_ids: tuple[str, ...]) -> dict[s
     return out
 
 
+# --- interval resolver (moved above the Filters section: the DT selectors
+# need it at render time; body unchanged) --------------------------------
+ROW_TOKEN_RE = re.compile(r"ROW\d+")
+
+
+def _workflow_raw(_client: Albert, wf_id: str) -> dict | None:
+    """Raw workflow JSON, bypassing the SDK's typed model.
+
+    Some workflows in this tenant carry placeholder intervals that have a Unit
+    but no `value`. The SDK's Interval model marks `value` as required, so
+    `workflows.get_by_id()` raises a pydantic ValidationError on an otherwise
+    well-formed response - and with `get_by_ids()` one bad workflow kills the whole
+    batch. So we go to the wire ourselves and read the dict."""
+    try:
+        resp = _client.session.get(f"/api/v3/workflows/{wf_id}")
+        data = resp.json()
+    except Exception:  # noqa: BLE001
+        return None
+    if isinstance(data, dict) and "Items" in data:
+        items = data.get("Items") or []
+        return items[0] if items else None
+    return data if isinstance(data, dict) else None
+
+
+def _workflow_interval_map(_client: Albert, wf_id: str) -> dict[str, list[str]]:
+    """token -> ordered axis setpoints, e.g.
+       "ROW3XROW22" -> ["Time: 0 day", "Speed: 20 RPM"]
+
+    SOURCE OF TRUTH: `IntervalCombinations[]`, where each entry has
+        interval        "ROW3XROW22"                  <- the token on property data
+        intervalParams  "INT1XINT1"                   <- per-parameter 1-based index
+        intervalString  "Time: 0 day,Speed: 20 RPM"   <- RESOLVED, ORDERED setpoints
+
+    The three fields are positionally aligned, so the Nth ROW token belongs to the
+    Nth comma-segment of intervalString. Axis identity is READ, never assumed.
+
+    Two things I previously got wrong, both disproved by the live payload:
+      * `Parameters[].Intervals[].rowId` is NOT a reliable source - on WFL446095 the
+        interval objects carry no rowId at all, so that map came out empty and every
+        token stayed raw.
+      * A ROW token is NOT a positional index and NOT the parameter's own
+        `prgPrmRowId`: Time's parameter row is ROW1, yet its four interval values
+        carry the tokens ROW3-ROW6. Tokens are workflow-scoped ids per interval VALUE.
+    """
+    out: dict[str, list[str]] = {}
+
+    combos: list = []
+    try:  # typed path first
+        wf = _client.workflows.get_by_id(id=wf_id)
+        for ic in getattr(wf, "interval_combinations", None) or []:
+            combos.append(
+                {
+                    "interval": getattr(ic, "interval_id", None),
+                    "intervalString": getattr(ic, "interval_string", None),
+                    "intervalDetails": getattr(ic, "interval_details", None),
+                }
+            )
+    except Exception:  # noqa: BLE001  (ValidationError on placeholder intervals)
+        raw = _workflow_raw(_client, wf_id)
+        if raw:
+            combos = raw.get("IntervalCombinations") or []
+
+    for c in combos:
+        token = c.get("interval") if isinstance(c, dict) else None
+        if not token:
+            continue
+        token = str(token)
+        # X-SAFE: never str.split("X") - a unit or parameter name may contain an X.
+        # ROW tokens are always ROW<int>, so a regex findall is safe.
+        row_tokens = ROW_TOKEN_RE.findall(token)
+
+        istr = c.get("intervalString") if isinstance(c, dict) else None
+        axes: list[str] = []
+        if istr:
+            # split on "," between axes, then the FIRST ":" between name and value
+            for seg in str(istr).split(","):
+                name, _, val = seg.partition(":")
+                name, val = name.strip(), val.strip()
+                axes.append(f"{name}: {val}" if name and val else (val or name))
+        else:
+            details = c.get("intervalDetails") or []
+            for d in details:
+                nm = d.get("name") if isinstance(d, dict) else getattr(d, "name", "")
+                vl = d.get("value") if isinstance(d, dict) else getattr(d, "value", "")
+                axes.append(f"{nm}: {vl}".strip(": "))
+
+        # N-AXIS SAFE: pair positionally; works for 1, 2 or more crossed axes
+        if axes:
+            out[token] = axes[: len(row_tokens)] if row_tokens else axes
+    return out
+
+
 exp_inventory_ids = tuple(
     c["inventory_id"] for c in columns if c["inventory_id"] and not c["is_label_col"]
 )
@@ -965,20 +1157,26 @@ facets = {
     for p, d in _facets_acc.items()
 }
 
-# Property Tasks from EVERY selected project, in project order, each tagged
-# with its project so the Results picker can group them (PROJECT ▸ Task).
+# Property Tasks + DT index from EVERY selected project, in project order
+# (one tasks.get_all call per project - see load_property_task_catalog).
+_catalog = load_property_task_catalog(
+    client, tuple(PROJECT_IDS), int(st.session_state.get("dt_cache_bust", 0))
+)
+dt_index: dict[str, dict] = _catalog["dt_index"]
+_short_of_pid = {pid: short for _, pid, short in selected_projects}
 property_tasks: list[dict] = []
-for _plabel, _pid, _pshort in selected_projects:
-    for _t in get_property_tasks(client, _pid):
-        _t = dict(_t)
-        _t["project_id"] = _pid
-        _t["project"] = _pshort
-        property_tasks.append(_t)
+for _t in _catalog["tasks"]:
+    _t = dict(_t)
+    _t["project"] = _short_of_pid.get(_t["project_id"], _t["project_id"])
+    property_tasks.append(_t)
 
 # ONE results store for the whole comparison, keyed by task id (globally
 # unique). Tasks belonging to a project that was removed from the comparison
 # are pruned so the tables and downloads never leak stale projects.
-RESULTS_STORE_KEY = "results_store::v4"
+# NOTE: the DT-first rework was specced as `results_store::v4::`, but v4 was
+# already taken by the task-first flow whose records lack dt_id/dc_id/unit_id
+# - bumped to v5 so every stale cache is guaranteed to bust.
+RESULTS_STORE_KEY = "results_store::v5"
 _store = st.session_state.setdefault(RESULTS_STORE_KEY, {})
 _valid_task_ids = {t["id"] for t in property_tasks}
 for _tid in [k for k in _store if k not in _valid_task_ids]:
@@ -1134,26 +1332,9 @@ with f3:
         help="Formulations derived from the selected predecessor formula(s). "
         f"'{NONE_LABEL}' = formulations with no predecessor.",
     )
-    # FIX #3: Data Templates is a RESULTS-ROW filter, not a column filter. It is
-    # only meaningful once Property Tasks have been loaded, and selecting one must
-    # never hide experiment columns from the other three sections.
-    loaded_dts = sorted(
-        {
-            r["Data Template"]
-            for recs in st.session_state.get(RESULTS_STORE_KEY, {}).values()
-            for r in recs
-            if "__error__" not in r and r.get("Data Template")
-        }
-    )
-    flt_result_dts = st.multiselect(
-        "Data Templates (Results only)",
-        loaded_dts,
-        disabled=not loaded_dts,
-        help="Filters the rows of the Results tables. Enabled once you load at least "
-        "one Property Task below. It does not hide experiment columns."
-        if loaded_dts
-        else "Load a Property Task in the Results section first.",
-    )
+    # The old "Data Templates (Results only)" multiselect moved into the
+    # "Selection of Data Templates in Results" sub-section below, where it
+    # drives WHAT the Results section downloads (DataTemplate-first flow).
 
 f4, f5, f6, f7 = st.columns(4)
 with f4:
@@ -1191,6 +1372,195 @@ def _safe_selectbox(label: str, options: list[str], key: str, **kw):
     if key in st.session_state and st.session_state[key] not in options:
         del st.session_state[key]
     return st.selectbox(label, options, key=key, **kw)
+
+
+def _safe_multiselect(label: str, options: list[str], key: str, default=None, **kw):
+    """multiselect whose stored values are pruned when they fall out of
+    `options`; `default` seeds the state only on first render."""
+    if key in st.session_state:
+        st.session_state[key] = [v for v in st.session_state[key] if v in options]
+    else:
+        st.session_state[key] = [v for v in (default or []) if v in options]
+    return st.multiselect(label, options, key=key, **kw)
+
+
+# ===========================================================================
+# 4c) SELECTION OF DATA TEMPLATES IN RESULTS - DataTemplate-first flow.
+#     Replaces the old "Data Templates (Results only)" filter. Each selector
+#     row picks ONE Data Template, its Data Columns and (optionally) one
+#     setpoint per interval axis. Everything here is METADATA ONLY (tasks /
+#     data_templates / workflows) - property data is downloaded exclusively
+#     by the "Load Data" button in the Results section.
+# ===========================================================================
+def dt_interval_axes(dt_id: str) -> list[dict]:
+    """Interval setpoints per axis for ONE Data Template: the union across
+    EVERY workflow of every block where the DT occurs (the same DT can sit on
+    different workflows in different tasks). Resolution goes through the
+    existing `_workflow_interval_map` (incl. its raw-HTTP fallback), and the
+    axis count is DERIVED from the resolved intervalString - never hardcoded.
+    Deduplication is by human-readable label. Returns
+        [{"values": [label, ...], "names": [axis-parameter names seen]}, ...]"""
+    wf_ids = sorted(
+        {
+            o["workflow_id"]
+            for o in dt_index.get(dt_id, {}).get("occurrences", [])
+            if o["workflow_id"]
+        }
+    )
+    cache: dict[str, dict[str, list[str]]] = st.session_state.setdefault("wf_intervals", {})
+    for w in wf_ids:
+        if w not in cache:
+            cache[w] = _workflow_interval_map(client, w)
+    axes: list[dict] = []
+    for w in wf_ids:
+        for _token, labels in cache[w].items():
+            for i, lab in enumerate(labels):
+                while len(axes) <= i:
+                    axes.append({"values": [], "names": []})
+                if lab not in axes[i]["values"]:
+                    axes[i]["values"].append(lab)
+                nm = lab.split(":", 1)[0].strip() if ":" in lab else ""
+                if nm and nm not in axes[i]["names"]:
+                    axes[i]["names"].append(nm)
+    return axes
+
+
+st.markdown("**Selection of Data Templates in Results**")
+st.caption(
+    "Choose WHICH Data Templates the Results section will download - and, per "
+    "template, which Data Columns and interval setpoints to show. This panel "
+    "makes metadata calls only; property data is fetched by **Load Data** in "
+    "the Results section."
+)
+
+_dt_label_of = {
+    f"{v['name'] or dt}  ({dt})": dt
+    for dt, v in sorted(
+        dt_index.items(), key=lambda kv: ((kv[1]["name"] or "").lower(), kv[0])
+    )
+}
+DT_PLACEHOLDER = "(select a Data Template)"
+
+_dtsel_count = int(st.session_state.get("dtsel_count", 0))
+if _dtsel_count == 0:
+    if st.button("➕ Add DT", key="dtsel_add_first", disabled=not _dt_label_of):
+        st.session_state["dtsel_count"] = 1
+        st.rerun()
+if not _dt_label_of:
+    st.caption("No Property Tasks with Data Templates found in the selected project(s).")
+
+dt_selectors: list[dict] = []
+for _i in range(_dtsel_count):
+    _cols = st.columns([1.7, 2.0, 1.4, 1.4])
+    with _cols[0]:
+        _lbl = _safe_selectbox(
+            "Data Templates",
+            [DT_PLACEHOLDER] + list(_dt_label_of),
+            key=f"dtsel::{_i}::dt",
+            help="Every Data Template that occurs on a Property Task of the "
+            "selected project(s), from the task index (no property data loaded).",
+        )
+    if _lbl == DT_PLACEHOLDER:
+        with _cols[1]:
+            st.multiselect(
+                "Data Columns", [], key=f"dtsel::{_i}::dc_ph", disabled=True
+            )
+        with _cols[2]:
+            st.selectbox("Interval 1", [ADV_ANY], key=f"dtsel::{_i}::iv1_ph", disabled=True)
+        with _cols[3]:
+            st.selectbox("Interval 2", [ADV_ANY], key=f"dtsel::{_i}::iv2_ph", disabled=True)
+        continue
+    _dt_id = _dt_label_of[_lbl]
+
+    # changing the DT of a row resets its dependent Data Columns / Intervals
+    if st.session_state.get(f"dtsel::{_i}::dt_prev") != _dt_id:
+        for _sfx in ("dc", "iv1", "iv2"):
+            st.session_state.pop(f"dtsel::{_i}::{_sfx}", None)
+        st.session_state[f"dtsel::{_i}::dt_prev"] = _dt_id
+
+    _dcs = load_dt_definition(client, _dt_id, int(st.session_state.get("dt_cache_bust", 0)))
+    _hidden_of = {_d["id"]: _d["hidden"] for _d in _dcs}
+    _dc_label_of = {
+        f"{_d['name']}  ({_d['id']})"
+        + (f"  [{_d['unit_symbol']}]" if _d["unit_symbol"] else ""): _d["id"]
+        for _d in _dcs
+    }
+    _default_dcs = [_l for _l, _did in _dc_label_of.items() if not _hidden_of.get(_did)]
+    with _cols[1]:
+        _sel_dc_labels = _safe_multiselect(
+            "Data Columns",
+            list(_dc_label_of),
+            key=f"dtsel::{_i}::dc",
+            default=_default_dcs,
+            help="From the Data Template definition (the unit symbols shown "
+            "here also label the Results, since property data carries only "
+            "unit ids). Defaults to every non-hidden data column.",
+        )
+
+    _axes = dt_interval_axes(_dt_id)
+    _iv_sel: list[str] = []
+    for _ax_i in (0, 1):
+        _ax = _axes[_ax_i] if _ax_i < len(_axes) else None
+        _has = bool(_ax and _ax["values"])
+        _iv_label = (
+            f"Interval {_ax_i + 1} — {_ax['names'][0]}"
+            if _has and len(_ax["names"]) == 1
+            else f"Interval {_ax_i + 1}"
+        )
+        with _cols[2 + _ax_i]:
+            _v = _safe_selectbox(
+                _iv_label,
+                ([ADV_ANY] + _ax["values"]) if _has else [ADV_ANY],
+                key=f"dtsel::{_i}::iv{_ax_i + 1}",
+                disabled=not _has,
+                help=(
+                    "Setpoints unioned across every workflow this Data Template "
+                    f"occurs on. '{ADV_ANY}' = don't filter this axis."
+                    if _has
+                    else "This Data Template has no interval on this axis."
+                ),
+            )
+            if _has and len(_ax["names"]) > 1:
+                st.caption(
+                    f"⚠️ Axis {_ax_i + 1} parameter differs across workflows: "
+                    + ", ".join(_ax["names"])
+                )
+        _iv_sel.append(_v)
+
+    _occ = dt_index.get(_dt_id, {}).get("occurrences", [])
+    dt_selectors.append(
+        {
+            "dt_id": _dt_id,
+            "dt_label": _lbl,
+            "dt_name": dt_index.get(_dt_id, {}).get("name", "") or _dt_id,
+            "dc_ids": {_dc_label_of[_l] for _l in _sel_dc_labels},
+            "iv1": _iv_sel[0],
+            "iv2": _iv_sel[1],
+            # match on (task_id, block_id) - block ids repeat across tasks
+            "occ": {(o["task_id"], o["block_id"]) for o in _occ},
+            "unit_symbol_of": {_d["id"]: _d["unit_symbol"] for _d in _dcs},
+            "axes": _axes,
+        }
+    )
+
+if _dtsel_count > 0:
+    _db = st.columns([1.2, 1.5, 4])
+    with _db[0]:
+        if st.button("➕ Add new DT", key="dtsel_add_more"):
+            st.session_state["dtsel_count"] = _dtsel_count + 1
+            st.rerun()
+    with _db[1]:
+        if st.button(
+            "🗑️ Remove last DT", key="dtsel_remove", disabled=_dtsel_count <= 1
+        ):
+            _j = _dtsel_count - 1
+            for _k in [k for k in st.session_state if str(k).startswith(f"dtsel::{_j}::")]:
+                del st.session_state[_k]
+            st.session_state["dtsel_count"] = _dtsel_count - 1
+            st.rerun()
+
+# read by the Load Data button and by the Results record filter
+st.session_state["dt_selectors"] = dt_selectors
 
 
 def _adv_row_value(row: dict, field: str) -> str:
@@ -1247,8 +1617,10 @@ if _adv_section_fields:
     st.caption(
         "Build a condition on a row's value (an ingredient amount, a property "
         "result, ...) to keep only the formulations that satisfy it - across every "
-        "table. Multiple filters are combined with AND. A Results filter needs its "
-        "Property Task loaded in the Results section below."
+        "table. Multiple filters are combined with AND. A Results filter applies "
+        "to the ALREADY-DOWNLOADED results (press Load Data in the Results "
+        "section first): it is a DISPLAY filter only and does not reduce what "
+        "Load Data fetches from Albert."
     )
 
     adv_count = int(st.session_state.get("adv_filter_count", 0))
@@ -1354,8 +1726,8 @@ if _adv_section_fields:
             st.caption(f"Filter {i + 1} (not applied yet): {summary}")
         elif is_result and not available:
             st.info(
-                f"Filter {i + 1}: load the matching Property Task in the Results "
-                f"section below to activate — {summary}"
+                f"Filter {i + 1}: press Load Data in the Results section below "
+                f"to activate — {summary}"
             )
         elif not available:
             st.warning(f"Filter {i + 1}: no rows match the selection — {summary}")
@@ -1983,6 +2355,7 @@ def _records_from_tpds(
     for tpd in tpds:
         dt = getattr(tpd, "data_template", None)
         dt_name = getattr(dt, "name", None) or getattr(dt, "id", "") or "(no template)"
+        dt_id = getattr(dt, "id", None) or ""
         # PropertyDataInventoryInformation exposes `.inventory_id` (alias "id")
         inv = getattr(tpd, "inventory", None)
         inv_id = getattr(inv, "inventory_id", None) or getattr(inv, "id", None)
@@ -2002,6 +2375,7 @@ def _records_from_tpds(
                     val = _column_value(col)
                     if val == "":
                         continue
+                    _col_unit = getattr(col, "unit", None)
                     recs.append(
                         {
                             "task_id": getattr(tpd, "task_id", None) or task_id,
@@ -2009,6 +2383,18 @@ def _records_from_tpds(
                             "task_name": task_name,
                             "workflow_id": wf_id,
                             "task_workflows": task_workflows,
+                            # ids used by the DataTemplate-first filter; the
+                            # unit SYMBOL is not here (property data carries
+                            # only Unit.id) - it is joined from the DT
+                            # definition at display time.
+                            "dt_id": dt_id,
+                            "dc_id": getattr(col, "id", None) or "",
+                            "unit_id": (
+                                _col_unit.get("id")
+                                if isinstance(_col_unit, dict)
+                                else getattr(_col_unit, "id", None)
+                            )
+                            or "",
                             "Data Template": dt_name,
                             "Data Column": getattr(col, "name", "") or "",
                             "Unit": _unit_name(col),
@@ -2021,144 +2407,6 @@ def _records_from_tpds(
                         }
                     )
     return recs
-
-
-def _block_workflow_map(_client: Albert, task_id: str) -> tuple[dict[str, str], list[str]]:
-    """(block_id -> workflow_id, all workflow ids on the task).
-
-    TaskPropertyData.InitialWorkflow / FinalWorkflow are frequently null on the
-    property-data response, so the workflow id has to come from the task itself:
-    Task -> Block -> Workflow -> IntervalCombinations. `tasks.get_by_id` returns a
-    hydrated PropertyTask (discriminated union), so `.blocks` is populated.
-    The flat list is a fallback for when block ids don't line up."""
-    out: dict[str, str] = {}
-    all_wf: list[str] = []
-    try:
-        task = _client.tasks.get_by_id(id=task_id)
-    except Exception:  # noqa: BLE001
-        return out, all_wf
-    for b in getattr(task, "blocks", None) or []:
-        bid = getattr(b, "id", None)
-        wfs = getattr(b, "workflow", None) or []
-        if not isinstance(wfs, list):
-            wfs = [wfs]
-        for wf in wfs:
-            wid = getattr(wf, "id", None)
-            if wid:
-                all_wf.append(str(wid))
-                if bid:
-                    out.setdefault(str(bid), str(wid))
-    return out, list(dict.fromkeys(all_wf))
-
-
-def _fetch_task_records(_client: Albert, task: dict) -> list[dict]:
-    """One task's property data -> flat records (worker thread).
-    Errors are RETURNED, not swallowed - a silent [] is indistinguishable
-    from 'task genuinely has no data'."""
-    try:
-        tpds = _client.property_data.get_all_task_properties(
-            task_id=task["id"], with_data_only=True
-        )
-    except Exception as e:  # noqa: BLE001
-        return [{"__error__": f"{type(e).__name__}: {e}", "task_id": task["id"]}]
-    wf_of_block, all_wf = _block_workflow_map(_client, task["id"])
-    return _records_from_tpds(
-        tpds,
-        task_name=task["name"],
-        task_id=task["id"],
-        wf_of_block=wf_of_block,
-        task_workflows=all_wf,
-    )
-
-
-ROW_TOKEN_RE = re.compile(r"ROW\d+")
-
-
-def _workflow_raw(_client: Albert, wf_id: str) -> dict | None:
-    """Raw workflow JSON, bypassing the SDK's typed model.
-
-    Some workflows in this tenant carry placeholder intervals that have a Unit
-    but no `value`. The SDK's Interval model marks `value` as required, so
-    `workflows.get_by_id()` raises a pydantic ValidationError on an otherwise
-    well-formed response - and with `get_by_ids()` one bad workflow kills the whole
-    batch. So we go to the wire ourselves and read the dict."""
-    try:
-        resp = _client.session.get(f"/api/v3/workflows/{wf_id}")
-        data = resp.json()
-    except Exception:  # noqa: BLE001
-        return None
-    if isinstance(data, dict) and "Items" in data:
-        items = data.get("Items") or []
-        return items[0] if items else None
-    return data if isinstance(data, dict) else None
-
-
-def _workflow_interval_map(_client: Albert, wf_id: str) -> dict[str, list[str]]:
-    """token -> ordered axis setpoints, e.g.
-       "ROW3XROW22" -> ["Time: 0 day", "Speed: 20 RPM"]
-
-    SOURCE OF TRUTH: `IntervalCombinations[]`, where each entry has
-        interval        "ROW3XROW22"                  <- the token on property data
-        intervalParams  "INT1XINT1"                   <- per-parameter 1-based index
-        intervalString  "Time: 0 day,Speed: 20 RPM"   <- RESOLVED, ORDERED setpoints
-
-    The three fields are positionally aligned, so the Nth ROW token belongs to the
-    Nth comma-segment of intervalString. Axis identity is READ, never assumed.
-
-    Two things I previously got wrong, both disproved by the live payload:
-      * `Parameters[].Intervals[].rowId` is NOT a reliable source - on WFL446095 the
-        interval objects carry no rowId at all, so that map came out empty and every
-        token stayed raw.
-      * A ROW token is NOT a positional index and NOT the parameter's own
-        `prgPrmRowId`: Time's parameter row is ROW1, yet its four interval values
-        carry the tokens ROW3-ROW6. Tokens are workflow-scoped ids per interval VALUE.
-    """
-    out: dict[str, list[str]] = {}
-
-    combos: list = []
-    try:  # typed path first
-        wf = _client.workflows.get_by_id(id=wf_id)
-        for ic in getattr(wf, "interval_combinations", None) or []:
-            combos.append(
-                {
-                    "interval": getattr(ic, "interval_id", None),
-                    "intervalString": getattr(ic, "interval_string", None),
-                    "intervalDetails": getattr(ic, "interval_details", None),
-                }
-            )
-    except Exception:  # noqa: BLE001  (ValidationError on placeholder intervals)
-        raw = _workflow_raw(_client, wf_id)
-        if raw:
-            combos = raw.get("IntervalCombinations") or []
-
-    for c in combos:
-        token = c.get("interval") if isinstance(c, dict) else None
-        if not token:
-            continue
-        token = str(token)
-        # X-SAFE: never str.split("X") - a unit or parameter name may contain an X.
-        # ROW tokens are always ROW<int>, so a regex findall is safe.
-        row_tokens = ROW_TOKEN_RE.findall(token)
-
-        istr = c.get("intervalString") if isinstance(c, dict) else None
-        axes: list[str] = []
-        if istr:
-            # split on "," between axes, then the FIRST ":" between name and value
-            for seg in str(istr).split(","):
-                name, _, val = seg.partition(":")
-                name, val = name.strip(), val.strip()
-                axes.append(f"{name}: {val}" if name and val else (val or name))
-        else:
-            details = c.get("intervalDetails") or []
-            for d in details:
-                nm = d.get("name") if isinstance(d, dict) else getattr(d, "name", "")
-                vl = d.get("value") if isinstance(d, dict) else getattr(d, "value", "")
-                axes.append(f"{nm}: {vl}".strip(": "))
-
-        # N-AXIS SAFE: pair positionally; works for 1, 2 or more crossed axes
-        if axes:
-            out[token] = axes[: len(row_tokens)] if row_tokens else axes
-    return out
 
 
 def _n_axes(records: list[dict]) -> int:
@@ -2216,159 +2464,51 @@ def resolve_intervals(records: list[dict]) -> None:
         r["_n_axes"] = n_axes
 
 
-def load_selected_results(_client: Albert) -> dict[str, list[dict]]:
-    """User picks Property Tasks; only those are fetched (README §12 - the
-    per-task endpoint is the fastest bulk path). Loaded tasks stay cached in
-    session_state.
-
-    `property_tasks` already pools every selected project in project order, so
-    the picker lists them grouped by project ('PROJECT ▸ Task [id]') and tasks
-    from different projects can be loaded and compared side by side."""
-    store: dict[str, list[dict]] = st.session_state.setdefault(RESULTS_STORE_KEY, {})
-
-    tasks = property_tasks
-    if not tasks:
-        st.warning("No Property Tasks found in the selected project(s).")
-        return store
-
-    label_of = {f"{t['project']} ▸ {t['name']}  [{t['id']}]": t for t in tasks}
-    # KEYED widget + a PLAIN shadow key. The stable `key` makes consecutive
-    # selection changes stick (feeding the value back through `default=` changes
-    # the widget's identity each rerun and silently drops the next change). The
-    # shadow restores the selection when an st.rerun() fired ABOVE this widget
-    # (Advanced-filter buttons, table buttons) aborts the script before this
-    # multiselect runs - Streamlit garbage-collects keyed state of any widget
-    # not instantiated during a run, which used to wipe the Results tables.
-    persist_key = "results_tasks_persist::multi"
-    widget_key = "results_tasks_widget"
-    if widget_key not in st.session_state:
-        st.session_state[widget_key] = list(st.session_state.get(persist_key, []))
-    st.session_state[widget_key] = [
-        l for l in st.session_state[widget_key] if l in label_of
-    ]
-    selected = st.multiselect(
-        f"Select the Property Tasks to load ({len(tasks)} available)",
-        list(label_of.keys()),
-        key=widget_key,
-        help="Grouped by project (PROJECT ▸ Task). Only the selected tasks are "
-        "downloaded - one API call each. Mix tasks from different projects to "
-        "compare their results side by side.",
-    )
-    st.session_state[persist_key] = selected
-    to_fetch = [label_of[l] for l in selected if label_of[l]["id"] not in store]
-
-    b1, b2, b3 = st.columns([1.4, 1.4, 1])
-    with b1:
-        if to_fetch and st.button(f"⬇️ Load {len(to_fetch)} selected task(s)", type="primary"):
-            _load_tasks(_client, store, to_fetch)
-    with b2:
-        stale = [label_of[l] for l in selected if label_of[l]["id"] in store]
-        if stale and st.button("🔄 Reload selected (discard cache)"):
-            for t in stale:
-                store.pop(t["id"], None)
-            st.session_state["wf_intervals"] = {}
-            st.session_state["wf_unresolved"] = {}
-            _load_tasks(_client, store, stale)
-    with b3:
-        st.session_state["fetch_workers"] = st.number_input(
-            "Parallel requests",
-            min_value=1,
-            max_value=48,
-            value=int(st.session_state.get("fetch_workers", 16)),
-            step=4,
-            help="Albert makes one request per (block x formulation). Raising this "
-            "shortens the load roughly proportionally. Back off if you see errors.",
-        )
-    if st.session_state.get("fetch_errors"):
-        st.warning(f"Some requests failed: {st.session_state['fetch_errors'][0]}")
-
-    return {
-        label_of[l]["id"]: store[label_of[l]["id"]]
-        for l in selected
-        if label_of[l]["id"] in store
-    }
-
-
-def _load_tasks(_client: Albert, store: dict, tasks_to_fetch: list[dict]) -> None:
-    """SPEED FIX. `property_data.get_all_task_properties(task_id)` is a SERIAL
-    N+1 inside the SDK: it calls check_for_task_data once, then fires ONE HTTP GET
-    per (block x inventory) combination, one after another. For a task with 11
-    blocks x 95 formulations that is ~1,000 sequential round-trips - which is why
-    loading a Property Block took minutes.
-
-    We keep the exact same endpoints (so units, lots, block ids and trials are all
-    preserved) but drive them ourselves: enumerate the combos for every selected
-    task, then fan out ALL of them across one shared thread pool. Wall time drops
-    roughly by the worker count.
-    """
+def load_target_results(_client: Albert, store: dict, tasks_to_fetch: list[dict]) -> None:
+    """DataTemplate-first loader: ONE `get_all_task_properties(task_id)` call
+    per target task (it returns ALL blocks of that task), fanned out across a
+    thread pool sized by the 'Parallel requests' input. The block -> workflow
+    map comes from the task catalog's inline Blocks[] - no per-task get_by_id.
+    Errors are STORED per task, not swallowed."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     workers = int(st.session_state.get("fetch_workers", 16))
-    prog = st.progress(0.0, text="Enumerating blocks...")
+    wf_info = {
+        t["id"]: (
+            {b["block_id"]: b["workflow_id"] for b in t.get("blocks", []) if b["workflow_id"]},
+            list(dict.fromkeys(b["workflow_id"] for b in t.get("blocks", []) if b["workflow_id"])),
+        )
+        for t in property_tasks
+    }
+    prog = st.progress(0.0, text=f"Fetching {len(tasks_to_fetch)} task(s)...")
 
-    # --- phase 1: per task, which (block, inventory, lot) combos have data? ----
-    def _combos(task: dict):
+    def _one(task: dict):
         try:
-            checks = _client.property_data.check_for_task_data(task_id=task["id"])
-        except Exception as e:  # noqa: BLE001
-            return task, None, [], f"{type(e).__name__}: {e}"
-        wf_of_block, all_wf = _block_workflow_map(_client, task["id"])
-        combos = [c for c in checks if getattr(c, "data_exists", False)]
-        return task, (wf_of_block, all_wf), combos, None
-
-    meta: dict[str, tuple] = {}
-    jobs: list[tuple[dict, Any]] = []
-    with ThreadPoolExecutor(max_workers=min(8, max(1, len(tasks_to_fetch)))) as ex:
-        for task, wfinfo, combos, err in ex.map(_combos, tasks_to_fetch):
-            if err:
-                store[task["id"]] = [{"__error__": err, "task_id": task["id"]}]
-                continue
-            meta[task["id"]] = wfinfo
-            store[task["id"]] = []
-            jobs.extend((task, c) for c in combos)
-
-    if not jobs:
-        prog.empty()
-        st.rerun()
-
-    # --- phase 2: fan every combo out across ONE pool -------------------------
-    def _one(job):
-        task, c = job
-        try:
-            tpd = _client.property_data.get_task_block_properties(
-                inventory_id=c.inventory_id,
-                task_id=task["id"],
-                block_id=c.block_id,
-                lot_id=getattr(c, "lot_id", None),
+            tpds = _client.property_data.get_all_task_properties(
+                task_id=task["id"], with_data_only=True
             )
         except Exception as e:  # noqa: BLE001
-            return task, None, f"{type(e).__name__}: {e}"
-        return task, tpd, None
+            return task, [{"__error__": f"{type(e).__name__}: {e}", "task_id": task["id"]}]
+        wf_of_block, all_wf = wf_info.get(task["id"], ({}, []))
+        return task, _records_from_tpds(
+            tpds,
+            task_name=task["name"],
+            task_id=task["id"],
+            wf_of_block=wf_of_block,
+            task_workflows=all_wf,
+        )
 
-    done, errs = 0, []
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = [ex.submit(_one, j) for j in jobs]
+    done = 0
+    with ThreadPoolExecutor(max_workers=min(workers, max(1, len(tasks_to_fetch)))) as ex:
+        futures = [ex.submit(_one, t) for t in tasks_to_fetch]
         for fut in as_completed(futures):
-            task, tpd, err = fut.result()
+            task, recs = fut.result()
+            store[task["id"]] = recs
             done += 1
-            if err:
-                errs.append(err)
-            elif tpd is not None:
-                wf_of_block, all_wf = meta.get(task["id"], ({}, []))
-                store[task["id"]].extend(
-                    _records_from_tpds(
-                        [tpd],
-                        task_name=task["name"],
-                        task_id=task["id"],
-                        wf_of_block=wf_of_block,
-                        task_workflows=all_wf,
-                    )
-                )
             prog.progress(
-                done / len(jobs), text=f"Fetching data {done}/{len(jobs)} (x{workers} parallel)"
+                done / len(tasks_to_fetch),
+                text=f"Fetching data {done}/{len(tasks_to_fetch)} task(s) (x{workers} parallel)",
             )
-    if errs:
-        st.session_state["fetch_errors"] = errs[:5]
     prog.empty()
     st.rerun()
 
@@ -2394,16 +2534,49 @@ RESULT_KEYS = ["Data Template", "Data Column", "Unit"] + INTERVAL_KEYS + ["Trial
 MERGE_DT_KEYS = ["Data Template", "Data Column", "Unit"] + INTERVAL_KEYS
 
 
+def _dt_selector_passes(r: dict, sels: list[dict]) -> bool:
+    """DataTemplate-first display filter: a record survives when it satisfies
+    at least ONE configured DT selector row -
+      * its (task_id, block_id) is an occurrence of that row's DT (block ids
+        repeat across tasks, so the PAIR is matched, never block_id alone);
+      * its data column is among the row's selected Data Columns;
+      * its resolved Interval 1 / Interval 2 equal the row's choices
+        ('(any)' = no constraint on that axis).
+    Requires resolve_intervals() to have run on the record."""
+    for s in sels:
+        if (r.get("task_id"), r.get("block_id")) not in s["occ"]:
+            continue
+        if r.get("dc_id") not in s["dc_ids"]:
+            continue
+        if s["iv1"] != ADV_ANY and r.get("Interval 1", "") != s["iv1"]:
+            continue
+        if s["iv2"] != ADV_ANY and r.get("Interval 2", "") != s["iv2"]:
+            continue
+        return True
+    return False
+
+
 def results_long_df(records: list[dict]) -> pd.DataFrame:
     """Tidy/long table - one row per recorded value (analysis-ready).
-    The Data Templates filter is applied HERE (rows), never to the columns."""
+    The DT / Data Column / interval selection is applied HERE (rows), never to
+    the experiment columns. Intervals are resolved BEFORE filtering because the
+    interval choice compares against the resolved axis labels."""
     recs = [r for r in records if "__error__" not in r]
-    if flt_result_dts:
-        recs = [r for r in recs if r.get("Data Template") in flt_result_dts]
     if not recs:
         return pd.DataFrame()
     resolve_intervals(recs)
+    sels = st.session_state.get("dt_selectors") or []
+    recs = [r for r in recs if _dt_selector_passes(r, sels)]
+    if not recs:
+        return pd.DataFrame()
     df = pd.DataFrame(recs)
+    # Unit SYMBOLS come from the DT definitions (property data has only ids)
+    _sym_of: dict[str, str] = {}
+    for s in sels:
+        _sym_of.update({k: v for k, v in s["unit_symbol_of"].items() if v})
+    _dc_col = df["dc_id"] if "dc_id" in df.columns else [""] * len(df)
+    _u_col = df["Unit"] if "Unit" in df.columns else [""] * len(df)
+    df["Unit"] = [_sym_of.get(dc) or u for dc, u in zip(_dc_col, _u_col)]
     df["Experiment"] = df["inventory_id"].map(
         lambda i: (invid_to_tuple.get(i) or ("", ""))[0] or _strip_inv(str(i or ""))
     )
@@ -2549,11 +2722,11 @@ for s in sections:
         show_df(sdf, key_cols_for(s), table_key=f"sec::{s['attr']}", row_ids=srids)
         continue
 
-    # ----- Results: pick tasks, load only those, drill-down per task --------
-    st.caption(
-        "Worksheet Property Blocks in the selected sheet(s): "
-        + " · ".join(f"📦 {r['name']}" for r in s["rows"] if r["name"])
-    )
+    # ----- Results: DataTemplate-first. What gets downloaded is defined by the
+    # "Selection of Data Templates in Results" panel in section 2 - here there
+    # is only the Load Data button, the loader and ONE merged table (the old
+    # per-task picker, the Property-Block listing and the Merge-by-DT toggle
+    # are gone; the view is always merged by DT).
     r1, r2 = st.columns(2)
     with r1:
         include_foreign = st.checkbox(
@@ -2576,104 +2749,136 @@ for s in sections:
     )
     st.session_state["results_agg_mode"] = "avg" if agg_choice == "Average" else "list"
 
-    merge_by_dt = st.checkbox(
-        "Merge Results by DT",
-        value=False,
-        key="results_merge_by_dt",
-        help="Pool every selected Property Block into ONE table, with one row per "
-        "Data Template + Data Column + Interval (regardless of which block it came "
-        "from). The XLSX export shows the same single table, with the experiment "
-        "columns aligned to the Product Design columns.",
-    )
+    # --- Load plan: union of the tasks behind every configured DT row ---------
+    _sels = st.session_state.get("dt_selectors") or []
+    target_tasks: dict[str, dict] = {}
+    for _sel in _sels:
+        for _o in dt_index.get(_sel["dt_id"], {}).get("occurrences", []):
+            target_tasks.setdefault(
+                _o["task_id"], {"id": _o["task_id"], "name": _o["task_name"]}
+            )
+    store = st.session_state.setdefault(RESULTS_STORE_KEY, {})
+    _to_fetch = [t for tid, t in target_tasks.items() if tid not in store]
 
-    loaded = load_selected_results(client)
-    task_names = {
-        t["id"]: (f"{t['project']} ▸ {t['name']}" if MULTI_PROJECT else t["name"])
-        for t in property_tasks
-    }
+    if not _sels:
+        st.info(
+            "Configure at least one Data Template in **Selection of Data "
+            "Templates in Results** (section 2) - then press Load Data here."
+        )
 
-    if merge_by_dt:
-        all_recs: list[dict] = []
-        for recs in loaded.values():
-            all_recs += [r for r in recs if "__error__" not in r]
+    lc1, lc2, lc3 = st.columns([1.5, 1.6, 1.2])
+    with lc1:
+        _pressed = st.button(
+            f"⬇️ Load Data ({len(target_tasks)} task(s))",
+            type="primary",
+            disabled=not target_tasks,
+            help="Downloads property data ONLY for the tasks where the selected "
+            "Data Templates occur (already-loaded tasks are reused from cache). "
+            "Data Column / interval choices filter the display and cost nothing.",
+        )
+    with lc2:
+        _reload = st.button(
+            "🔄 Reload (discard caches)",
+            disabled=not target_tasks,
+            help="Busts the DT/task index, the Data Template definitions, the "
+            "workflow interval cache and the results store, then re-fetches.",
+        )
+    with lc3:
+        st.session_state["fetch_workers"] = st.number_input(
+            "Parallel requests",
+            min_value=1,
+            max_value=48,
+            value=int(st.session_state.get("fetch_workers", 16)),
+            step=4,
+            help="One request per task (get_all_task_properties). Raising this "
+            "shortens the load when several tasks are fetched. Back off on errors.",
+        )
+
+    if _reload:
+        st.session_state["dt_cache_bust"] = int(st.session_state.get("dt_cache_bust", 0)) + 1
+        load_property_task_catalog.clear()
+        load_dt_definition.clear()
+        st.session_state["wf_intervals"] = {}
+        st.session_state["wf_unresolved"] = {}
+        st.session_state[RESULTS_STORE_KEY] = {}
+        st.rerun()
+    if _pressed:
+        if _to_fetch:
+            load_target_results(client, store, _to_fetch)
+        # nothing to fetch -> everything already cached; fall through and render
+
+    # --- render: ONE table, always merged by DT -------------------------------
+    loaded_recs: list[dict] = []
+    _errors: list[str] = []
+    for _tid in target_tasks:
+        for _r in store.get(_tid, []):
+            if "__error__" in _r:
+                _errors.append(f"{_tid}: {_r['__error__']}")
+            else:
+                loaded_recs.append(_r)
+    if _errors:
+        st.error(f"API call failed: {_errors[0]}")
+
+    _loaded_n = sum(1 for _tid in target_tasks if _tid in store)
+    if _sels and not _loaded_n:
+        st.caption("No property data loaded yet - press **Load Data**.")
+    elif _sels:
+        st.caption(
+            f"Merged view · {_loaded_n} task(s) loaded · one row per "
+            "Data Template / Data Column / Interval, filtered by the DT panel "
+            "in section 2 (Data Columns + intervals are display filters on the "
+            "cached download)."
+        )
+
+    if long_view:
+        ldf = results_long_df(loaded_recs)
+        if ldf.empty:
+            st.info("No rows match the current DT / Data Column / interval selection.")
+        else:
+            st.dataframe(ldf, use_container_width=True, hide_index=True)
+    else:
         mdf = results_drilldown_df(
-            all_recs, include_foreign=include_foreign, group_keys=MERGE_DT_KEYS
+            loaded_recs, include_foreign=include_foreign, group_keys=MERGE_DT_KEYS
         )
         if mdf.empty and len(visible_cols) < len(exp_cols_all):
+            # keep the table visible when column filters hid every carrier
             mdf = results_drilldown_df(
-                all_recs, include_foreign=include_foreign,
+                loaded_recs, include_foreign=include_foreign,
                 group_keys=MERGE_DT_KEYS, keep_all_rows=True,
             )
-        st.caption(
-            f"Merged view · {len(loaded)} Property Block(s) pooled into one table by "
-            "Data Template / Data Column / Interval."
-        )
         if mdf.empty:
-            st.info(
-                "No results to merge yet. Load at least one Property Task, and check "
-                "the Data Template filter / 'Include experiments filtered out'."
-            )
+            if loaded_recs:
+                st.info(
+                    "Data is loaded, but no row matches the current Data Column / "
+                    "interval selection - or none of it belongs to the visible "
+                    "experiments (tick 'Include experiments filtered out')."
+                )
         else:
             rids = [
                 "|".join(str(mdf.iloc[i][k]) for k in MERGE_DT_KEYS) for i in range(len(mdf))
             ]
             show_df(mdf, MERGE_DT_KEYS, table_key="res::merged_by_dt", row_ids=rids)
-        continue
 
-    for task_id, recs in loaded.items():
-        task_name = task_names.get(task_id, task_id)
-        errors = [r["__error__"] for r in recs if "__error__" in r]
-        with st.expander(f"📦 {task_name}  ·  {task_id}", expanded=True):
-            if errors:
-                st.error(f"API call failed: {errors[0]}")
-                continue
-            if not recs:
-                st.warning(
-                    "Albert returned no property data for this task "
-                    "(`check_for_task_data` found no combination with data). "
-                    "Use the raw-payload expander at the bottom to inspect it."
-                )
-                continue
-            df = results_long_df(recs) if long_view else results_drilldown_df(
-                recs, include_foreign=include_foreign
+    # --- Diagnostics: how the DT-first index maps to the load plan ------------
+    with st.expander("🔧 DT index & Load plan (DataTemplate-first)"):
+        st.write("**dt_index** (from `tasks.get_all` inline Blocks - zero property data):")
+        st.json(dt_index, expanded=False)
+        if _sels:
+            st.write("**Resolved interval axes per configured DT:**")
+            st.write(
+                {
+                    f"{_sel['dt_name']} ({_sel['dt_id']})": [
+                        {"axis": i + 1, "parameters": ax["names"], "values": ax["values"]}
+                        for i, ax in enumerate(_sel["axes"])
+                    ]
+                    or "(no intervals on any workflow)"
+                    for _sel in _sels
+                }
             )
-            # Keep the table visible whenever ANY column filter is active (the base
-            # "1️⃣ Filters" - tags / ingredient / creator / ... - as well as the
-            # Advanced filter) and this task happens to have no data for the surviving
-            # formulations. Without this the drilldown collapses to a bare message and
-            # the whole Results table appears to vanish after filtering. Gating on the
-            # column count (not on adv_specs) covers the base filters too.
-            fallback_note = False
-            if df.empty and not long_view and len(visible_cols) < len(exp_cols_all):
-                kept = results_drilldown_df(
-                    recs, include_foreign=include_foreign, keep_all_rows=True
-                )
-                if not kept.empty:
-                    df = kept
-                    fallback_note = True
-            if df.empty:
-                if flt_result_dts:
-                    st.write(
-                        "No rows in this task match the selected Data Template(s). "
-                        "The experiment columns are unaffected."
-                    )
-                else:
-                    st.write(
-                        "Data exists, but none of it belongs to the currently visible "
-                        "experiments - tick 'Include experiments filtered out'."
-                    )
-            elif long_view:
-                st.dataframe(df, use_container_width=True, hide_index=True)
-            else:
-                if fallback_note:
-                    st.caption(
-                        "This task has no measurements for the currently visible "
-                        "formulations — showing them as (empty) columns. Tick "
-                        "**Include experiments filtered out** to also show the values "
-                        "recorded on filtered-out / other-sheet experiments."
-                    )
-                rids = ["|".join(str(df.iloc[i][k]) for k in RESULT_KEYS) for i in range(len(df))]
-                show_df(df, RESULT_KEYS, table_key=f"res::{task_id}", row_ids=rids)
+        st.write(
+            "**Tasks that Load Data will fetch** (union across DT rows, deduped):",
+            sorted(target_tasks),
+        )
 
 
 # ===========================================================================
@@ -2736,11 +2941,9 @@ def build_xlsx() -> bytes:
     from openpyxl.utils import get_column_letter
 
     # --- one key block wide enough for the widest section ---------------------
-    merge_by_dt = bool(st.session_state.get("results_merge_by_dt"))
+    # DataTemplate-first: the Results view is ALWAYS merged by DT.
     per_section_keys = {s["attr"]: key_cols_for(s) for s in sections}
-    per_section_keys["result_design"] = (
-        MERGE_DT_KEYS if merge_by_dt else ["Property Task"] + RESULT_KEYS
-    )
+    per_section_keys["result_design"] = MERGE_DT_KEYS
     KEY_W = max(len(v) for v in per_section_keys.values())
     FIRST_EXP = KEY_W + 1  # 1-based column of the first experiment
 
@@ -2870,7 +3073,7 @@ def build_xlsx() -> bytes:
         else:
             # 'Merge Results by DT': one pooled table (no Property Task column);
             # otherwise the per-task table with Property Task as the outermost key.
-            rdf = merged_results_by_dt_df() if merge_by_dt else all_results_df()
+            rdf = merged_results_by_dt_df()  # always merged by DT
             keys = per_section_keys["result_design"]
             write_section(
                 s["label"],
