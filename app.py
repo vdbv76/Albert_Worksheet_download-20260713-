@@ -1122,7 +1122,13 @@ def _adv_spec_passes(spec: dict, inv_id: str) -> bool:
         return len(nonempty) > 0
     if logic == "does not exist":
         return len(nonempty) == 0
-    return any(_cmp_pass(v, logic, a, b) for v in nonempty)
+    # Precise comparison: the formulation passes only if it HAS a matching value
+    # AND *every* matching value satisfies the condition. Using all() (not any())
+    # means a formulation with any measurement that violates the threshold - e.g. a
+    # Cobb Value of 10.2 under a "< 10" filter, be it a replicate trial or a value
+    # from an interval the cascade did not fully pin down - is correctly excluded,
+    # so no value shown in the table can contradict the applied filter.
+    return len(nonempty) > 0 and all(_cmp_pass(v, logic, a, b) for v in nonempty)
 
 
 def advanced_filter_passes(inv_id: str) -> bool:
@@ -1955,6 +1961,12 @@ def load_selected_results(_client: Albert, pid: str) -> dict[str, list[dict]]:
     selected = st.multiselect(
         f"Select the Property Tasks to load ({len(tasks)} available)",
         list(label_of.keys()),
+        # A stable key persists the selection in session_state by name. Without it
+        # the widget's auto-generated id depends on how many elements precede it, so
+        # applying an Advanced filter (which changes the filter panel above) shifted
+        # the id and silently reset the selection to empty - making the loaded
+        # Results table vanish until the Property Task was picked again.
+        key=f"results_tasks_select::{pid}",
         help="Only the selected tasks are downloaded - one API call each.",
     )
     to_fetch = [label_of[l] for l in selected if label_of[l]["id"] not in store]
