@@ -2281,7 +2281,7 @@ for s in sections:
         mdf = results_drilldown_df(
             all_recs, include_foreign=include_foreign, group_keys=MERGE_DT_KEYS
         )
-        if mdf.empty and adv_specs:
+        if mdf.empty and len(visible_cols) < len(exp_cols_all):
             mdf = results_drilldown_df(
                 all_recs, include_foreign=include_foreign,
                 group_keys=MERGE_DT_KEYS, keep_all_rows=True,
@@ -2319,14 +2319,20 @@ for s in sections:
             df = results_long_df(recs) if long_view else results_drilldown_df(
                 recs, include_foreign=include_foreign
             )
-            # Keep the table visible under an active Advanced filter even when this
-            # task has no data for the passing formulations (show them as columns).
+            # Keep the table visible whenever ANY column filter is active (the base
+            # "1️⃣ Filters" - tags / ingredient / creator / ... - as well as the
+            # Advanced filter) and this task happens to have no data for the surviving
+            # formulations. Without this the drilldown collapses to a bare message and
+            # the whole Results table appears to vanish after filtering. Gating on the
+            # column count (not on adv_specs) covers the base filters too.
             fallback_note = False
-            if df.empty and not long_view and adv_specs:
-                df = results_drilldown_df(
+            if df.empty and not long_view and len(visible_cols) < len(exp_cols_all):
+                kept = results_drilldown_df(
                     recs, include_foreign=include_foreign, keep_all_rows=True
                 )
-                fallback_note = not df.empty
+                if not kept.empty:
+                    df = kept
+                    fallback_note = True
             if df.empty:
                 if flt_result_dts:
                     st.write(
@@ -2343,8 +2349,10 @@ for s in sections:
             else:
                 if fallback_note:
                     st.caption(
-                        "This task has no measurements for the filtered formulations — "
-                        "showing the filtered formulation columns (values empty)."
+                        "This task has no measurements for the currently visible "
+                        "formulations — showing them as (empty) columns. Tick "
+                        "**Include experiments filtered out** to also show the values "
+                        "recorded on filtered-out / other-sheet experiments."
                     )
                 rids = ["|".join(str(df.iloc[i][k]) for k in RESULT_KEYS) for i in range(len(df))]
                 show_df(df, RESULT_KEYS, table_key=f"res::{task_id}", row_ids=rids)
