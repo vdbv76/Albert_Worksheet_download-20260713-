@@ -776,7 +776,7 @@ def column_header(c: dict) -> tuple[str, str]:
 # 4) GLOBAL FILTERS - one state, applied to every section table + downloads
 #    Re-implementation of Albert's 7 client-side UI filters (README §9).
 # ===========================================================================
-st.header("2️⃣ Filters (apply to all sections)")
+st.header("2️⃣ Filters")
 
 exp_cols_all = [c for c in columns if c["inventory_id"] and not c["is_label_col"]]
 
@@ -903,6 +903,234 @@ with f7:
     )
 
 
+# ===========================================================================
+# 4b) ADVANCED FILTER - cascade conditions that hide formulation COLUMNS.
+#     Each filter drills a section's row hierarchy to a target row (or a whole
+#     group), attaches a condition (> / < / = / Range / exists / does not exist)
+#     on that row's value, and keeps only the formulations that satisfy EVERY
+#     applied filter (AND). Results filters need the Property Task loaded first.
+# ===========================================================================
+ADV_ANY = "(any)"
+
+
+def _safe_selectbox(label: str, options: list[str], key: str, **kw):
+    """selectbox whose stored value is reset when it falls out of `options`
+    (cascade child options change when a parent changes - Streamlit would
+    otherwise raise on the stale session_state value)."""
+    if key in st.session_state and st.session_state[key] not in options:
+        del st.session_state[key]
+    return st.selectbox(label, options, key=key, **kw)
+
+
+def _adv_row_value(row: dict, field: str) -> str:
+    """Value of a cascade field (Name / Group / Subgroup n) for a Product/Process row."""
+    if field == "Name":
+        return row.get("name", "") or ""
+    path = row.get("path", []) or []
+    if field == "Group":
+        return path[0] if len(path) > 0 else ""
+    if field.startswith("Subgroup "):
+        try:
+            i = int(field.split()[1])
+        except ValueError:
+            return ""
+        return path[i] if len(path) > i else ""
+    return ""
+
+
+# Cascade fields each filterable section exposes (Apps excluded).
+_adv_section_fields: dict[str, list[str]] = {}
+if section_by_attr.get("product_design"):
+    _pd_depth = section_by_attr["product_design"]["max_depth"]
+    _adv_section_fields["product_design"] = (
+        ["Group"] + [f"Subgroup {i}" for i in range(1, max(_pd_depth, 1))] + ["Name"]
+    )
+if section_by_attr.get("result_design"):
+    _adv_section_fields["result_design"] = [
+        "Data Template", "Data Column", "Interval 1", "Interval 2"
+    ]
+if section_by_attr.get("process_design"):
+    _adv_section_fields["process_design"] = ["Name", "Group"]
+
+_adv_labels = {
+    "product_design": "Product Design",
+    "result_design": "Results",
+    "process_design": "Process Design",
+}
+_adv_label_to_attr = {
+    _adv_labels[a]: a for a in _adv_labels if a in _adv_section_fields
+}
+
+# Loaded Results records (populated lazily lower on the page; persist across reruns).
+_adv_result_records = [
+    r
+    for recs in st.session_state.get(f"results_store::v3::{project_id}", {}).values()
+    for r in recs
+    if isinstance(r, dict) and "__error__" not in r
+]
+
+adv_specs: list[dict] = []
+
+if _adv_section_fields:
+    st.markdown("**Advanced filter**")
+    st.caption(
+        "Build a condition on a row's value (an ingredient amount, a property "
+        "result, ...) to keep only the formulations that satisfy it - across every "
+        "table. Multiple filters are combined with AND. A Results filter needs its "
+        "Property Task loaded in the Results section below."
+    )
+
+    adv_count = int(st.session_state.get("adv_filter_count", 0))
+    if adv_count == 0:
+        if st.button("➕ Add filter", key="adv_add_first"):
+            st.session_state["adv_filter_count"] = 1
+            st.rerun()
+
+    _adv_field_slots = max((len(f) for f in _adv_section_fields.values()), default=1)
+    _attr_options = list(_adv_label_to_attr.keys())
+
+    for i in range(adv_count):
+        st.markdown(f"**Filter {i + 1}**")
+        seccol = st.columns([1.3] + [1.2] * _adv_field_slots)
+        with seccol[0]:
+            sec_label = _safe_selectbox("Section", _attr_options, key=f"advf::{i}::section")
+        attr = _adv_label_to_attr[sec_label]
+        fields = _adv_section_fields[attr]
+        is_result = attr == "result_design"
+        base = _adv_result_records if is_result else section_by_attr[attr]["rows"]
+
+        # --- cascade (progressive; stop at the first (any)) -------------------
+        selected: dict[str, str] = {}
+        matching = list(base)
+        stop = False
+        for k, field in enumerate(fields):
+            if stop:
+                break
+            if is_result:
+                opts = sorted(
+                    {str(r.get(field, "")) for r in matching if str(r.get(field, "")).strip()}
+                )
+            else:
+                opts = sorted(
+                    {_adv_row_value(r, field) for r in matching if _adv_row_value(r, field)}
+                )
+            with seccol[min(k + 1, len(seccol) - 1)]:
+                choice = _safe_selectbox(field, [ADV_ANY] + opts, key=f"advf::{i}::{attr}::{field}")
+            if choice != ADV_ANY:
+                selected[field] = choice
+                if is_result:
+                    matching = [r for r in matching if str(r.get(field, "")) == choice]
+                else:
+                    matching = [r for r in matching if _adv_row_value(r, field) == choice]
+            else:
+                stop = True
+
+        # --- numeric target? decides which Logic operators are offered -------
+        sample: list[str] = []
+        if is_result:
+            for r in matching:
+                v = str(r.get("value", ""))
+                if v:
+                    sample.append(v)
+                if len(sample) >= 300:
+                    break
+        else:
+            for r in matching:
+                for v in (r.get("values", {}) or {}).values():
+                    if v:
+                        sample.append(v)
+                if len(sample) >= 300:
+                    break
+        numeric = bool(sample) and all(_to_number(v)[1] for v in sample)
+        logic_opts = (
+            [">", "<", "=", "Range", "exists", "does not exist"]
+            if numeric
+            else ["exists", "does not exist"]
+        )
+
+        # --- Logic + Value + Apply ------------------------------------------
+        lvcol = st.columns([1.1, 1.1, 1.1, 1.0])
+        with lvcol[0]:
+            logic = _safe_selectbox("Logic", logic_opts, key=f"advf::{i}::logic")
+        a = b = ""
+        needs_value = logic in (">", "<", "=", "Range")
+        if needs_value:
+            with lvcol[1]:
+                a = st.text_input("From" if logic == "Range" else "Value", key=f"advf::{i}::a")
+            if logic == "Range":
+                with lvcol[2]:
+                    b = st.text_input("To", key=f"advf::{i}::b")
+        with lvcol[3]:
+            st.write("")  # nudge the button down to align with the inputs
+            if st.button("✅ Apply filter", key=f"advf::{i}::applybtn"):
+                st.session_state[f"advf::{i}::active"] = True
+                st.rerun()
+
+        # --- status + spec ---------------------------------------------------
+        active = bool(st.session_state.get(f"advf::{i}::active"))
+        if logic == "Range":
+            complete = a.strip() != "" or b.strip() != ""
+        elif needs_value:
+            complete = a.strip() != ""
+        else:
+            complete = True
+        available = len(matching) > 0 and (not is_result or len(_adv_result_records) > 0)
+
+        crumb = " › ".join(selected.get(f, ADV_ANY) for f in fields) or ADV_ANY
+        val_txt = (f" {a}" + (f"..{b}" if logic == "Range" else "")) if needs_value else ""
+        summary = f"{sec_label} · {crumb} · {logic}{val_txt}"
+
+        if not active:
+            st.caption(f"Filter {i + 1} (not applied yet): {summary}")
+        elif is_result and not available:
+            st.info(
+                f"Filter {i + 1}: load the matching Property Task in the Results "
+                f"section below to activate — {summary}"
+            )
+        elif not available:
+            st.warning(f"Filter {i + 1}: no rows match the selection — {summary}")
+        elif not complete:
+            st.warning(f"Filter {i + 1}: enter a value to activate — {summary}")
+        else:
+            st.success(f"✓ Filter {i + 1}: {summary}")
+            adv_specs.append(
+                {"is_result": is_result, "matching": matching, "logic": logic, "a": a, "b": b}
+            )
+
+    if adv_count > 0:
+        bcol = st.columns([1.3, 1.5, 4])
+        with bcol[0]:
+            if st.button("➕ Add new filter", key="adv_add_more"):
+                st.session_state["adv_filter_count"] = adv_count + 1
+                st.rerun()
+        with bcol[1]:
+            if st.button("🗑️ Remove last filter", key="adv_remove"):
+                _j = adv_count - 1
+                for _k in [k for k in st.session_state if str(k).startswith(f"advf::{_j}::")]:
+                    del st.session_state[_k]
+                st.session_state["adv_filter_count"] = max(0, adv_count - 1)
+                st.rerun()
+
+
+def _adv_spec_passes(spec: dict, inv_id: str) -> bool:
+    logic, a, b = spec["logic"], spec["a"], spec["b"]
+    if spec["is_result"]:
+        vals = [str(r.get("value", "")) for r in spec["matching"] if r.get("inventory_id") == inv_id]
+    else:
+        vals = [row["values"].get(inv_id, "") for row in spec["matching"]]
+    nonempty = [v for v in vals if str(v) != ""]
+    if logic == "exists":
+        return len(nonempty) > 0
+    if logic == "does not exist":
+        return len(nonempty) == 0
+    return any(_cmp_pass(v, logic, a, b) for v in nonempty)
+
+
+def advanced_filter_passes(inv_id: str) -> bool:
+    """AND of every applied Advanced filter. True when none are applied."""
+    return all(_adv_spec_passes(s, inv_id) for s in adv_specs)
+
+
 def _ingredient_hit(col: dict, wanted: list[str]) -> bool:
     inv = col["inventory_id"]
     hits = [
@@ -957,7 +1185,11 @@ def column_passes(c: dict) -> bool:
     return True
 
 
-visible_cols = [c for c in exp_cols_all if column_passes(c)]
+visible_cols = [
+    c
+    for c in exp_cols_all
+    if column_passes(c) and advanced_filter_passes(c["inventory_id"])
+]
 
 n_hidden = sum(1 for c in exp_cols_all if c["hidden"])
 st.caption(
@@ -1058,63 +1290,10 @@ def _row_in_filter(r: dict, row_filter: dict[int, list[str]]) -> bool:
     return True
 
 
-def _cmp_filter_widget(
-    label: str,
-    key: str,
-    fields: dict[str, list[str]],
-    default_field: str,
-    help_txt: str = "",
-) -> tuple[str, str, str, str]:
-    """3-step comparison filter:
-        (1) pick a field (e.g. Name, Data Column),
-        (2) pick an operator ( > / = / < / Range ),
-        (3) pick a value (Range picks two).
-    `fields` maps each selectable field name to the sorted distinct values present
-    in it. Returns (field, mode, a, b)."""
-    field_names = list(fields.keys())
-    if not field_names:
-        return ("", "All", "", "")
-    c0, c1, c2, c3 = st.columns([1.5, 0.9, 1.3, 1.3])
-    with c0:
-        idx = field_names.index(default_field) if default_field in field_names else 0
-        field = st.selectbox(
-            label, field_names, index=idx, key=f"{key}::field", help=help_txt or None
-        )
-    with c1:
-        mode = st.selectbox("Operator", ["All", ">", "=", "<", "Range"], key=f"{key}::mode")
-    vals = fields.get(field, [])
-    a = b = ""
-    if mode != "All":
-        with c2:
-            a = st.selectbox(
-                "From" if mode == "Range" else "Value",
-                [""] + vals,
-                key=f"{key}::a::{field}",
-            )
-    if mode == "Range":
-        with c3:
-            b = st.selectbox("To", [""] + vals, key=f"{key}::b::{field}")
-    return field, mode, a, b
-
-
-def _row_field_value(r: dict, field: str, hcols: list[str]) -> str:
-    """The value of one key field (Name / Row type / Group / Subgroup n) for a row,
-    used to evaluate the Product-Design comparison filter."""
-    if field == "Name":
-        return r["name"]
-    if field == "Row type":
-        return r["type"]
-    if field in hcols:
-        i = hcols.index(field)
-        return r["path"][i] if len(r["path"]) > i else ""
-    return ""
-
-
 def rows_dataframe(
     section: dict,
     row_filter: dict | None = None,
     with_ids: bool = False,
-    key_cmp: tuple[str, str, str, str] | None = None,
 ):
     hcols = hier_cols_for(section)
     kcols = key_cols_for(section)
@@ -1124,10 +1303,6 @@ def rows_dataframe(
             continue
         if row_filter and not _row_in_filter(r, row_filter):
             continue
-        if key_cmp:
-            _field, _mode, _a, _b = key_cmp
-            if not _cmp_pass(_row_field_value(r, _field, hcols), _mode, _a, _b):
-                continue
         vals = {c["inventory_id"]: r["values"].get(c["inventory_id"], "") for c in visible_cols}
         if focus_view and not any(v != "" for v in vals.values()):
             continue
@@ -1922,17 +2097,6 @@ def results_long_df(records: list[dict]) -> pd.DataFrame:
         lambda i: (invid_to_tuple.get(i) or ("", ""))[1]
     )
     df["Visible (passes filters)"] = df["inventory_id"].isin(invid_to_tuple)
-
-    # Results-only row filters (field comparison + Interval selection).
-    dc_f = st.session_state.get("res_dc_filter")
-    if dc_f and dc_f[1] != "All" and dc_f[0] in df.columns:
-        _field, _mode, _a, _b = dc_f
-        df = df[df[_field].map(lambda x: _cmp_pass(x, _mode, _a, _b))]
-    iv_sel = st.session_state.get("res_interval_filter") or []
-    if iv_sel:
-        icols = [c for c in df.columns if str(c).startswith("Interval ")]
-        if icols:
-            df = df[df[icols].apply(lambda row: any(str(v) in iv_sel for v in row), axis=1)]
     return df
 
 
@@ -2063,34 +2227,7 @@ for s in sections:
                         help=f"'{NONE_LABEL}' = rows with no {hc.lower()}.",
                     )
 
-        # --- Product Design: field filter (pick field -> operator -> value) --
-        key_cmp = None
-        if s["attr"] == "product_design":
-            _hc = hier_cols_for(s)
-            _field_opts = ["Name"] + _hc + (["Row type"] if show_type_col else [])
-            _fields: dict[str, list[str]] = {}
-            for _f in _field_opts:
-                _vals = sorted(
-                    {
-                        _row_field_value(r, _f, _hc)
-                        for r in s["rows"]
-                        if _row_field_value(r, _f, _hc)
-                    }
-                )
-                if _vals:
-                    _fields[_f] = _vals
-            if _fields:
-                st.markdown("**Filter rows** — pick a field, an operator and a value")
-                key_cmp = _cmp_filter_widget(
-                    "Field",
-                    key=f"namefilter::{s['attr']}",
-                    fields=_fields,
-                    default_field="Name",
-                    help_txt="Filter Product Design rows: choose the column (Name, "
-                    "Group, Subgroup ...), then >, =, < or Range, then a value.",
-                )
-
-        sdf, srids = rows_dataframe(s, row_filter, with_ids=True, key_cmp=key_cmp)
+        sdf, srids = rows_dataframe(s, row_filter, with_ids=True)
         show_df(sdf, key_cols_for(s), table_key=f"sec::{s['attr']}", row_ids=srids)
         continue
 
@@ -2129,49 +2266,6 @@ for s in sections:
         "Data Template + Data Column + Interval (regardless of which block it came "
         "from). The XLSX export shows the same single table, with the experiment "
         "columns aligned to the Product Design columns.",
-    )
-
-    # --- Results-only filters: Data Column (>, <, range) + Interval ----------
-    _recs_for_opts = _loaded_records()
-    if _recs_for_opts:
-        resolve_intervals(_recs_for_opts)
-    iv_options = sorted(
-        {
-            str(r.get(k))
-            for r in _recs_for_opts
-            for k in list(r.keys())
-            if str(k).startswith("Interval ") and str(r.get(k)).strip()
-        }
-    )
-    res_field_opts = ["Data Column", "Data Template", "Unit", "Trial"]
-    res_fields: dict[str, list[str]] = {}
-    for _f in res_field_opts:
-        _vals = sorted(
-            {str(r.get(_f, "")) for r in _recs_for_opts if str(r.get(_f, "")).strip()}
-        )
-        if _vals:
-            res_fields[_f] = _vals
-    st.markdown("**Results filters** — pick a field, an operator and a value")
-    if res_fields:
-        st.session_state["res_dc_filter"] = _cmp_filter_widget(
-            "Field",
-            key="res_dc",
-            fields=res_fields,
-            default_field="Data Column",
-            help_txt="Filter Results rows: choose the column (Data Column, Data "
-            "Template, Unit, Trial), then >, =, < or Range, then a value.",
-        )
-    else:
-        st.session_state["res_dc_filter"] = None
-        st.caption("Load a Property Task below to enable the Data Column filter.")
-    st.session_state["res_interval_filter"] = st.multiselect(
-        "Interval",
-        iv_options,
-        key="res_interval",
-        help="Show only rows recorded at the selected interval(s). Options are the "
-        "intervals present in the loaded Property Tasks."
-        if iv_options
-        else "Load a Property Task below; its intervals will appear here.",
     )
 
     loaded = load_selected_results(client, project_id)
