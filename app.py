@@ -1958,17 +1958,23 @@ def load_selected_results(_client: Albert, pid: str) -> dict[str, list[dict]]:
         return store
 
     label_of = {f"{t['name']}  [{t['id']}]": t for t in tasks}
+    # Persist the selection in a PLAIN (non-widget) session_state key, and feed it
+    # back through `default`. A widget `key` alone is NOT enough here: the Advanced
+    # filter's "Add new filter" / "Apply filter" / "Remove" buttons call st.rerun(),
+    # which aborts the script BEFORE this multiselect (rendered lower down) runs.
+    # Streamlit garbage-collects the state of any widget not instantiated during a
+    # run, so a keyed selection is wiped on that aborted run and the Results table
+    # vanished until the task was re-picked. A plain key survives the rerun and
+    # restores the selection on the next full run.
+    persist_key = f"results_tasks_persist::{pid}"
+    prev = [l for l in st.session_state.get(persist_key, []) if l in label_of]
     selected = st.multiselect(
         f"Select the Property Tasks to load ({len(tasks)} available)",
         list(label_of.keys()),
-        # A stable key persists the selection in session_state by name. Without it
-        # the widget's auto-generated id depends on how many elements precede it, so
-        # applying an Advanced filter (which changes the filter panel above) shifted
-        # the id and silently reset the selection to empty - making the loaded
-        # Results table vanish until the Property Task was picked again.
-        key=f"results_tasks_select::{pid}",
+        default=prev,
         help="Only the selected tasks are downloaded - one API call each.",
     )
+    st.session_state[persist_key] = selected
     to_fetch = [label_of[l] for l in selected if label_of[l]["id"] not in store]
 
     b1, b2, b3 = st.columns([1.4, 1.4, 1])
