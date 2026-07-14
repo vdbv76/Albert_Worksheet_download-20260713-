@@ -999,13 +999,14 @@ if _adv_section_fields:
         is_result = attr == "result_design"
         base = _adv_result_records if is_result else section_by_attr[attr]["rows"]
 
-        # --- cascade (progressive; stop at the first (any)) -------------------
+        # --- cascade -----------------------------------------------------------
+        # Every level is shown; (any) means "don't constrain here" and the cascade
+        # CONTINUES, so empty intermediate Subgroups can be left at (any) and you can
+        # still drill down to Name. Each level's options come from the rows/records
+        # that already match the non-(any) selections above it.
         selected: dict[str, str] = {}
         matching = list(base)
-        stop = False
         for k, field in enumerate(fields):
-            if stop:
-                break
             if is_result:
                 opts = sorted(
                     {str(r.get(field, "")) for r in matching if str(r.get(field, "")).strip()}
@@ -1022,8 +1023,6 @@ if _adv_section_fields:
                     matching = [r for r in matching if str(r.get(field, "")) == choice]
                 else:
                     matching = [r for r in matching if _adv_row_value(r, field) == choice]
-            else:
-                stop = True
 
         # --- numeric target? decides which Logic operators are offered -------
         sample: list[str] = []
@@ -2131,10 +2130,14 @@ def results_drilldown_df(
     records: list[dict],
     include_foreign: bool = False,
     group_keys: list[str] | None = None,
+    keep_all_rows: bool = False,
 ) -> pd.DataFrame:
     """Pivot: DT | DC | Unit | I1 | I2 | Trial rows x visible experiment cols.
     `include_foreign` also shows inventory items filtered out or belonging to
     other sheets (dropped silently before = looked like 'no data').
+    `keep_all_rows` keeps a property row even when none of the visible (passing)
+    formulations carry a value for it, so the table stays visible under an active
+    Advanced filter instead of collapsing to an empty frame.
     `group_keys` overrides the row key (e.g. MERGE_DT_KEYS drops Trial so several
     Property Blocks pool into one row per Data Template / Column / Interval)."""
     keys = group_keys or RESULT_KEYS
@@ -2166,7 +2169,7 @@ def results_drilldown_df(
             if t:
                 rec[t] = r["value"]
                 has = True
-        if has:
+        if has or keep_all_rows:
             recs.append(rec)
     if not recs:
         return pd.DataFrame()
@@ -2278,6 +2281,11 @@ for s in sections:
         mdf = results_drilldown_df(
             all_recs, include_foreign=include_foreign, group_keys=MERGE_DT_KEYS
         )
+        if mdf.empty and adv_specs:
+            mdf = results_drilldown_df(
+                all_recs, include_foreign=include_foreign,
+                group_keys=MERGE_DT_KEYS, keep_all_rows=True,
+            )
         st.caption(
             f"Merged view · {len(loaded)} Property Block(s) pooled into one table by "
             "Data Template / Data Column / Interval."
@@ -2311,6 +2319,14 @@ for s in sections:
             df = results_long_df(recs) if long_view else results_drilldown_df(
                 recs, include_foreign=include_foreign
             )
+            # Keep the table visible under an active Advanced filter even when this
+            # task has no data for the passing formulations (show them as columns).
+            fallback_note = False
+            if df.empty and not long_view and adv_specs:
+                df = results_drilldown_df(
+                    recs, include_foreign=include_foreign, keep_all_rows=True
+                )
+                fallback_note = not df.empty
             if df.empty:
                 if flt_result_dts:
                     st.write(
@@ -2325,6 +2341,11 @@ for s in sections:
             elif long_view:
                 st.dataframe(df, use_container_width=True, hide_index=True)
             else:
+                if fallback_note:
+                    st.caption(
+                        "This task has no measurements for the filtered formulations — "
+                        "showing the filtered formulation columns (values empty)."
+                    )
                 rids = ["|".join(str(df.iloc[i][k]) for k in RESULT_KEYS) for i in range(len(df))]
                 show_df(df, RESULT_KEYS, table_key=f"res::{task_id}", row_ids=rids)
 
