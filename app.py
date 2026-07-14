@@ -249,36 +249,90 @@ if client is None:
 
 
 # ===========================================================================
-# 1) Project & sheet selection
+# 1) Project & sheet selection - MULTI-PROJECT COMPARISON BASKET
+#    Search is repeatable: every search only ADDS options to the Project
+#    multiselect, so earlier picks survive the next search. Selecting a
+#    project = adding it to the comparison; the chip's ✕ removes it.
 # ===========================================================================
-st.header("1️⃣ Project & sheet")
+st.header("1️⃣ Projects & sheets")
 
 c1, c2 = st.columns([3, 1])
 with c1:
-    q = st.text_input("Search project (e.g. MO13137)")
+    q = st.text_input(
+        "Search project (e.g. MO13137)",
+        help="Search as many times as you need: each search adds its matches to "
+        "the Project list below, and the projects you already selected stay "
+        "selected. That is how you build a multi-project comparison.",
+    )
 with c2:
     only_mine = st.checkbox("Only my projects")
 
 if st.button("🔎 Search"):
     try:
         with st.spinner("Searching..."):
-            st.session_state["projects"] = list(
+            found = list(
                 client.projects.search(
                     text=q or None,
                     my_project=True if only_mine else None,
                     max_items=50,
                 )
             )
+        st.session_state["projects"] = found
+        if not found:
+            st.info("No projects matched this search - previous picks are kept.")
     except Exception as e:  # noqa: BLE001
         st.error(f"Search failed: {e}")
 
-projects = st.session_state.get("projects", [])
-if not projects:
+# The PROJECT CATALOG accumulates every project any search has returned this
+# session (label -> id). It is what lets the Project multiselect keep showing
+# (and keep selected) projects found by EARLIER searches after a new search
+# replaces st.session_state["projects"].
+proj_catalog: dict[str, str] = st.session_state.setdefault("proj_catalog", {})
+for p in st.session_state.get("projects", []):
+    proj_catalog[f"{p.description}  [{p.id}]"] = p.id
+
+if not proj_catalog:
+    st.info("Search for a project above to get started.")
     st.stop()
 
-proj_labels = {f"{p.description}  [{p.id}]": p.id for p in projects}
-sel_proj = st.selectbox("Project", list(proj_labels.keys()))
-project_id = proj_labels[sel_proj]
+
+def _proj_short(label: str, pid: str) -> str:
+    """Short display code for a project, used to group Sheets / Property Tasks
+    by project inside their dropdowns (e.g. 'MO13137 ▸ Sheet1'). The first
+    token of the project description is normally the project code."""
+    desc = label.rsplit("  [", 1)[0].strip()
+    tok = desc.split()[0] if desc.split() else ""
+    if 3 <= len(tok) <= 20:
+        return tok
+    return desc[:20] or pid
+
+
+# Same plain-key persistence pattern as the Results task picker below: a
+# widget key alone would be garbage-collected by any st.rerun() that aborts
+# the script before this widget runs, wiping the basket.
+_prev_proj = [l for l in st.session_state.get("proj_basket", []) if l in proj_catalog]
+sel_proj_labels = st.multiselect(
+    "Project",
+    list(proj_catalog.keys()),
+    default=_prev_proj,
+    help="Every selected project joins the comparison. Search again above to "
+    "find and add more projects - this selection is kept. Remove a project "
+    "with the ✕ on its chip.",
+)
+st.session_state["proj_basket"] = sel_proj_labels
+
+if not sel_proj_labels:
+    st.info("Select at least one project to load its worksheet.")
+    st.stop()
+
+# [(label, project_id, short_code), ...] in selection order
+selected_projects = [
+    (l, proj_catalog[l], _proj_short(l, proj_catalog[l])) for l in sel_proj_labels
+]
+MULTI_PROJECT = len(selected_projects) > 1
+PROJECT_IDS = [pid for _, pid, _ in selected_projects]
+COMPARE_TAG = "_".join(s for _, _, s in selected_projects)[:80]
+TITLE_PROJECTS = "  +  ".join(l for l, _, _ in selected_projects)
 
 
 @st.cache_resource(show_spinner="Loading worksheet from Albert...")
@@ -286,20 +340,63 @@ def get_worksheet(_client: Albert, pid: str):
     return _client.worksheets.get_by_project_id(project_id=pid)
 
 
-try:
-    worksheet = get_worksheet(client, project_id)
-except Exception as e:  # noqa: BLE001
-    st.error(f"Could not load the worksheet: {e}")
+# --- one grouped Sheet dropdown across every selected project ---------------
+# Streamlit multiselects have no native option groups, so grouping is done by
+# ordering (all of project 1's sheets, then project 2's, ...) and by prefixing
+# each sheet with its project code: 'MO13137 ▸ Sheet1'.
+sheet_entries: dict[str, tuple[str, str, str, Any]] = {}  # label -> (pid, short, sheet_name, sheet_obj)
+for _plabel, _pid, _pshort in selected_projects:
+    try:
+        _ws = get_worksheet(client, _pid)
+    except Exception as e:  # noqa: BLE001
+        st.error(f"Could not load the worksheet of {_plabel}: {e}")
+        continue
+    _shs = getattr(_ws, "sheets", None) or []
+    if not _shs:
+        st.warning(f"{_pshort}: this project's worksheet has no sheets.")
+        continue
+    for _s in _shs:
+        _nm = getattr(_s, "name", "") or "(unnamed)"
+        _lbl = f"{_pshort} ▸ {_nm}"
+        _n = 2
+        while _lbl in sheet_entries:  # two projects may share code + sheet name
+            _lbl = f"{_pshort} ▸ {_nm} ({_n})"
+            _n += 1
+        sheet_entries[_lbl] = (_pid, _pshort, _nm, _s)
+
+if not sheet_entries:
     st.stop()
 
-sheets = worksheet.sheets or []
-if not sheets:
-    st.warning("This project's worksheet has no sheets.")
+# Default: the FIRST sheet of a newly added project is auto-selected once, so
+# a fresh comparison shows data immediately - but a sheet the user deselects
+# afterwards stays deselected.
+_seeded: set[str] = st.session_state.setdefault("sheets_seeded", set())
+_prev_sheets = [l for l in st.session_state.get("sheets_basket", []) if l in sheet_entries]
+for _plabel, _pid, _pshort in selected_projects:
+    if _pid in _seeded:
+        continue
+    _first = next((lbl for lbl, v in sheet_entries.items() if v[0] == _pid), None)
+    if _first:
+        _prev_sheets.append(_first)
+        _seeded.add(_pid)
+_prev_sheets = list(dict.fromkeys(_prev_sheets))
+
+sel_sheet_labels = st.multiselect(
+    "Sheet",
+    list(sheet_entries.keys()),
+    default=_prev_sheets,
+    help="Sheets are grouped by project (PROJECT ▸ Sheet). Select any number - "
+    "the selected sheets are merged into ONE comparison worksheet below: rows "
+    "with the same Group / name align on one row, and every project's "
+    "experiment columns appear side by side.",
+)
+st.session_state["sheets_basket"] = sel_sheet_labels
+
+if not sel_sheet_labels:
+    st.info("Select at least one sheet to compare.")
     st.stop()
 
-sheet_names = {getattr(s, "name", "") or "(unnamed)": s for s in sheets}
-sel_sheet_name = st.selectbox("Sheet", list(sheet_names.keys()))
-sheet = sheet_names[sel_sheet_name]
+TITLE_SHEETS = "  |  ".join(sel_sheet_labels)
 
 
 # ===========================================================================
@@ -551,11 +648,119 @@ def extract_sheet(_sheet, sheet_key: str) -> dict:
     return {"columns": columns, "sections": sections}
 
 
-data = extract_sheet(sheet, f"{project_id}::{sel_sheet_name}")
+def merge_extracted(entries: list[dict]) -> dict:
+    """Fold every selected (project, sheet) into ONE virtual worksheet.
+
+    COLUMNS are concatenated in selection order (project 1's sheets first),
+    deduped by inventory_id (the same formulation on two selected sheets keeps
+    one column), and each carries an `origin` tag ('MO13137 / Sheet1') that
+    rides along in header tooltips and the description row.
+
+    ROWS are aligned across sheets by (ancestor path, name, row type): the
+    same ingredient / parameter row in two projects lands on ONE row whose
+    `values` dict (keyed by inventory_id, globally unique) holds every
+    project's cells side by side. Rows unique to a later sheet are appended
+    after the earlier sheets' rows, keeping each sheet's own order intact.
+    row_ids are prefixed with the project id - grid row ids like ROW4 repeat
+    across projects and would otherwise collide in the selection state.
+    """
+    multi = len(entries) > 1
+    columns: list[dict] = []
+    seen_inv: set[str] = set()
+    for e in entries:
+        origin = f"{e['short']} / {e['sheet']}" if multi else ""
+        for c in e["data"]["columns"]:
+            inv = c["inventory_id"]
+            if inv:
+                if inv in seen_inv:
+                    continue
+                seen_inv.add(inv)
+            cc = dict(c)
+            cc["origin"] = origin
+            columns.append(cc)
+
+    merged: dict[str, dict] = {}
+    for e in entries:
+        for s in e["data"]["sections"]:
+            tgt = merged.get(s["attr"])
+            if tgt is None:
+                tgt = {
+                    "attr": s["attr"],
+                    "label": s["label"],
+                    "rows": [],
+                    "hierarchy_source": [],
+                    "hierarchy_error": None,
+                    "hierarchy_keys": {},
+                    "hierarchy_raw": {},
+                    "hierarchy_unresolved": set(),
+                    "max_depth": 0,
+                    "_row_index": {},
+                }
+                merged[s["attr"]] = tgt
+            tgt["hierarchy_source"].append(f"{e['label']}: {s['hierarchy_source']}")
+            tgt["hierarchy_error"] = tgt["hierarchy_error"] or s["hierarchy_error"]
+            for k, n in (s["hierarchy_keys"] or {}).items():
+                tgt["hierarchy_keys"][k] = tgt["hierarchy_keys"].get(k, 0) + n
+            if s["hierarchy_raw"] is not None:
+                tgt["hierarchy_raw"][e["label"]] = s["hierarchy_raw"]
+            tgt["hierarchy_unresolved"].update(s.get("hierarchy_unresolved") or [])
+            tgt["max_depth"] = max(tgt["max_depth"], s["max_depth"])
+            for r in s["rows"]:
+                key = (tuple(r["path"]), r["name"], r["type_raw"].split(".")[-1])
+                hit = tgt["_row_index"].get(key)
+                if hit is None:
+                    rr = dict(r)
+                    rr["row_id"] = f"{e['pid']}::{r['row_id']}"
+                    rr["values"] = dict(r["values"])
+                    rr["origins"] = [e["label"]]
+                    tgt["_row_index"][key] = rr
+                    tgt["rows"].append(rr)
+                else:
+                    hit["values"].update(r["values"])
+                    hit["origins"].append(e["label"])
+
+    sections = []
+    for attr, _lab in SECTION_ORDER:
+        sec = merged.get(attr)
+        if not sec:
+            continue
+        sec.pop("_row_index")
+        sec["hierarchy_source"] = " | ".join(sec["hierarchy_source"])
+        sec["hierarchy_raw"] = sec["hierarchy_raw"] or None
+        sec["hierarchy_unresolved"] = sorted(sec["hierarchy_unresolved"])
+        sections.append(sec)
+    return {"columns": columns, "sections": sections}
+
+
+sheet_data_entries: list[dict] = []
+for _lbl in sel_sheet_labels:
+    _pid, _pshort, _snm, _sobj = sheet_entries[_lbl]
+    try:
+        _d = extract_sheet(_sobj, f"{_pid}::{_snm}")
+    except Exception as e:  # noqa: BLE001
+        st.error(f"Could not read {_lbl}: {e}")
+        continue
+    sheet_data_entries.append(
+        {"pid": _pid, "short": _pshort, "sheet": _snm, "label": _lbl, "data": _d}
+    )
+
+if not sheet_data_entries:
+    st.warning("None of the selected sheets could be read.")
+    st.stop()
+
+data = merge_extracted(sheet_data_entries)
 columns, sections = data["columns"], data["sections"]
 
+if len(sheet_data_entries) > 1:
+    st.caption(
+        "🔀 **Comparing "
+        + " · ".join(f"`{e['label']}`" for e in sheet_data_entries)
+        + "** - merged into one worksheet: same-named rows are aligned on one row, "
+        "each project keeps its own experiment columns."
+    )
+
 if not sections:
-    st.warning("No grid data found in this sheet.")
+    st.warning("No grid data found in the selected sheet(s).")
     st.stop()
 
 section_by_attr = {s["attr"]: s for s in sections}
@@ -720,21 +925,56 @@ exp_inventory_ids = tuple(
     c["inventory_id"] for c in columns if c["inventory_id"] and not c["is_label_col"]
 )
 inv_meta = load_inventory_meta(client, exp_inventory_ids)
-facets = load_facets(client, project_id)
-property_tasks = get_property_tasks(client, project_id)
+
+# Facets are project-scoped -> load per selected project and merge (counts of
+# the same value are summed across projects).
+_facets_acc: dict[str, dict[str, int]] = {}
+for _plabel, _pid, _pshort in selected_projects:
+    for _param, _vals in load_facets(client, _pid).items():
+        _d = _facets_acc.setdefault(_param, {})
+        for _nm, _cnt in _vals:
+            _d[_nm] = _d.get(_nm, 0) + _cnt
+facets = {
+    p: sorted(d.items(), key=lambda kv: (-kv[1], kv[0].lower()))
+    for p, d in _facets_acc.items()
+}
+
+# Property Tasks from EVERY selected project, in project order, each tagged
+# with its project so the Results picker can group them (PROJECT ▸ Task).
+property_tasks: list[dict] = []
+for _plabel, _pid, _pshort in selected_projects:
+    for _t in get_property_tasks(client, _pid):
+        _t = dict(_t)
+        _t["project_id"] = _pid
+        _t["project"] = _pshort
+        property_tasks.append(_t)
+
+# ONE results store for the whole comparison, keyed by task id (globally
+# unique). Tasks belonging to a project that was removed from the comparison
+# are pruned so the tables and downloads never leak stale projects.
+RESULTS_STORE_KEY = "results_store::v4"
+_store = st.session_state.setdefault(RESULTS_STORE_KEY, {})
+_valid_task_ids = {t["id"] for t in property_tasks}
+for _tid in [k for k in _store if k not in _valid_task_ids]:
+    del _store[_tid]
 
 # --- PREDECESSOR: only lives in the worksheet's Apps design PDC row ----------
 # It is NOT a field on InventoryItem (not top-level, not in Metadata, no facet).
 # We read the Apps grid via the per-design /grid endpoint, which is NOT subject
 # to the 20k-item truncation that hits sheets.get_cell_values on large sheets.
 def _apps_row_values(row_type: str) -> dict[str, str]:
+    """Union across every matching row - the merged multi-project worksheet can
+    carry one PDC row per project when their names/paths differ."""
     sec = section_by_attr.get("app_design")
     if not sec:
         return {}
+    out: dict[str, str] = {}
     for r in sec["rows"]:
         if r["type_raw"].split(".")[-1].upper() == row_type:
-            return {inv: v for inv, v in r["values"].items() if v}
-    return {}
+            for inv, v in r["values"].items():
+                if v:
+                    out.setdefault(inv, v)
+    return out
 
 
 predecessor_by_inv = _apps_row_values("PDC")
@@ -769,6 +1009,11 @@ def column_header(c: dict) -> tuple[str, str]:
             break
     if not code:
         code = _strip_inv(c["inventory_id"])
+    # In a multi-project comparison the description carries the column's origin
+    # (project / sheet), shown in header tooltips and the description row.
+    origin = c.get("origin") or ""
+    if origin:
+        long_name = f"{long_name}  ·  {origin}" if long_name else origin
     return (code, long_name)
 
 
@@ -869,7 +1114,7 @@ with f3:
     loaded_dts = sorted(
         {
             r["Data Template"]
-            for recs in st.session_state.get(f"results_store::v3::{project_id}", {}).values()
+            for recs in st.session_state.get(RESULTS_STORE_KEY, {}).values()
             for r in recs
             if "__error__" not in r and r.get("Data Template")
         }
@@ -964,7 +1209,7 @@ _adv_label_to_attr = {
 # Loaded Results records (populated lazily lower on the page; persist across reruns).
 _adv_result_records = [
     r
-    for recs in st.session_state.get(f"results_store::v3::{project_id}", {}).values()
+    for recs in st.session_state.get(RESULTS_STORE_KEY, {}).values()
     for r in recs
     if isinstance(r, dict) and "__error__" not in r
 ]
@@ -1945,19 +2190,22 @@ def resolve_intervals(records: list[dict]) -> None:
         r["_n_axes"] = n_axes
 
 
-def load_selected_results(_client: Albert, pid: str) -> dict[str, list[dict]]:
+def load_selected_results(_client: Albert) -> dict[str, list[dict]]:
     """User picks Property Tasks; only those are fetched (README §12 - the
     per-task endpoint is the fastest bulk path). Loaded tasks stay cached in
-    session_state."""
-    store_key = f"results_store::v3::{pid}"
-    store: dict[str, list[dict]] = st.session_state.setdefault(store_key, {})
+    session_state.
+
+    `property_tasks` already pools every selected project in project order, so
+    the picker lists them grouped by project ('PROJECT ▸ Task [id]') and tasks
+    from different projects can be loaded and compared side by side."""
+    store: dict[str, list[dict]] = st.session_state.setdefault(RESULTS_STORE_KEY, {})
 
     tasks = property_tasks
     if not tasks:
-        st.warning("No Property Tasks found in this project.")
+        st.warning("No Property Tasks found in the selected project(s).")
         return store
 
-    label_of = {f"{t['name']}  [{t['id']}]": t for t in tasks}
+    label_of = {f"{t['project']} ▸ {t['name']}  [{t['id']}]": t for t in tasks}
     # Persist the selection in a PLAIN (non-widget) session_state key, and feed it
     # back through `default`. A widget `key` alone is NOT enough here: the Advanced
     # filter's "Add new filter" / "Apply filter" / "Remove" buttons call st.rerun(),
@@ -1966,13 +2214,15 @@ def load_selected_results(_client: Albert, pid: str) -> dict[str, list[dict]]:
     # run, so a keyed selection is wiped on that aborted run and the Results table
     # vanished until the task was re-picked. A plain key survives the rerun and
     # restores the selection on the next full run.
-    persist_key = f"results_tasks_persist::{pid}"
+    persist_key = "results_tasks_persist::multi"
     prev = [l for l in st.session_state.get(persist_key, []) if l in label_of]
     selected = st.multiselect(
         f"Select the Property Tasks to load ({len(tasks)} available)",
         list(label_of.keys()),
         default=prev,
-        help="Only the selected tasks are downloaded - one API call each.",
+        help="Grouped by project (PROJECT ▸ Task). Only the selected tasks are "
+        "downloaded - one API call each. Mix tasks from different projects to "
+        "compare their results side by side.",
     )
     st.session_state[persist_key] = selected
     to_fetch = [label_of[l] for l in selected if label_of[l]["id"] not in store]
@@ -2096,7 +2346,7 @@ def _load_tasks(_client: Albert, store: dict, tasks_to_fetch: list[dict]) -> Non
 def _loaded_records() -> list[dict]:
     return [
         r
-        for recs in st.session_state.get(f"results_store::v3::{project_id}", {}).values()
+        for recs in st.session_state.get(RESULTS_STORE_KEY, {}).values()
         for r in recs
         if "__error__" not in r
     ]
@@ -2271,7 +2521,7 @@ for s in sections:
 
     # ----- Results: pick tasks, load only those, drill-down per task --------
     st.caption(
-        "Worksheet Property Blocks in this sheet: "
+        "Worksheet Property Blocks in the selected sheet(s): "
         + " · ".join(f"📦 {r['name']}" for r in s["rows"] if r["name"])
     )
     r1, r2 = st.columns(2)
@@ -2306,8 +2556,11 @@ for s in sections:
         "columns aligned to the Product Design columns.",
     )
 
-    loaded = load_selected_results(client, project_id)
-    task_names = {t["id"]: t["name"] for t in property_tasks}
+    loaded = load_selected_results(client)
+    task_names = {
+        t["id"]: (f"{t['project']} ▸ {t['name']}" if MULTI_PROJECT else t["name"])
+        for t in property_tasks
+    }
 
     if merge_by_dt:
         all_recs: list[dict] = []
@@ -2400,7 +2653,7 @@ st.header("4️⃣ Download")
 
 
 def all_results_df() -> pd.DataFrame:
-    store = st.session_state.get(f"results_store::v3::{project_id}", {})
+    store = st.session_state.get(RESULTS_STORE_KEY, {})
     frames = []
     for task_id, recs in store.items():
         clean = [r for r in recs if "__error__" not in r]
@@ -2414,7 +2667,7 @@ def all_results_df() -> pd.DataFrame:
 def merged_results_by_dt_df() -> pd.DataFrame:
     """'Merge Results by DT' pooled across every loaded Property Block: one row per
     Data Template / Data Column / Interval, experiment columns shared."""
-    store = st.session_state.get(f"results_store::v3::{project_id}", {})
+    store = st.session_state.get(RESULTS_STORE_KEY, {})
     all_recs: list[dict] = []
     for recs in store.values():
         all_recs += [r for r in recs if "__error__" not in r]
@@ -2422,7 +2675,7 @@ def merged_results_by_dt_df() -> pd.DataFrame:
 
 
 def all_results_long_df() -> pd.DataFrame:
-    store = st.session_state.get(f"results_store::v3::{project_id}", {})
+    store = st.session_state.get(RESULTS_STORE_KEY, {})
     frames = [results_long_df(recs) for recs in store.values()]
     frames = [f for f in frames if not f.empty]
     if not frames:
@@ -2480,13 +2733,13 @@ def build_xlsx() -> bytes:
     box = Border(left=thin, right=thin, top=thin, bottom=thin)
 
     # --- title block ----------------------------------------------------------
-    ws.cell(row=1, column=1, value=f"Albert Worksheet - {sel_proj}").font = Font(
+    ws.cell(row=1, column=1, value=f"Albert Worksheet - {TITLE_PROJECTS}").font = Font(
         bold=True, size=14
     )
     ws.cell(
         row=2,
         column=1,
-        value=f"Sheet: {sel_sheet_name}   |   {len(visible_cols)} of {len(exp_cols_all)} "
+        value=f"Sheet(s): {TITLE_SHEETS}   |   {len(visible_cols)} of {len(exp_cols_all)} "
         f"experiments shown   |   exported {pd.Timestamp.now():%Y-%m-%d %H:%M}",
     ).font = ital
 
@@ -2644,7 +2897,7 @@ with d1:
     st.download_button(
         "📥 XLSX (filtered worksheet + results)",
         data=_xlsx,
-        file_name=f"albert_{project_id}.xlsx",
+        file_name=f"albert_{COMPARE_TAG}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
@@ -2653,7 +2906,7 @@ with d2:
     st.download_button(
         "📥 CSV (results pivot)",
         data=rdf.to_csv(index=False) if not rdf.empty else "",
-        file_name=f"albert_{project_id}_results.csv",
+        file_name=f"albert_{COMPARE_TAG}_results.csv",
         mime="text/csv",
         use_container_width=True,
         disabled=rdf.empty,
@@ -2663,7 +2916,7 @@ with d3:
     st.download_button(
         "📥 CSV (results tidy/long)",
         data=ldf.to_csv(index=False) if not ldf.empty else "",
-        file_name=f"albert_{project_id}_results_long.csv",
+        file_name=f"albert_{COMPARE_TAG}_results_long.csv",
         mime="text/csv",
         use_container_width=True,
         disabled=ldf.empty,
