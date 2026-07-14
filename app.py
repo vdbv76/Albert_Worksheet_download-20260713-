@@ -1196,8 +1196,25 @@ st.caption(
     + (f" ({n_hidden} hidden in Albert)" if not show_hidden and n_hidden else "")
 )
 if not visible_cols:
-    st.warning("No experiment column passes the current filters.")
-    st.stop()
+    # An Advanced filter that no formulation satisfies (e.g. a value nobody hits,
+    # or a Results filter whose Property block belongs to formulations that are not
+    # columns on this sheet) would otherwise remove EVERY experiment column. A hard
+    # st.stop() here blanks the whole Worksheet below - Product Design, Results and
+    # all - so the Results table "disappears" the moment such a filter is applied.
+    # When the emptiness is caused by the Advanced filter, warn loudly but keep the
+    # page rendering (the section tables fall back to their key columns) so the user
+    # can see what happened and relax the filter. A base-filter wipeout keeps the
+    # original hard stop.
+    if adv_specs:
+        st.warning(
+            "⚠️ **No experiment column passes the Advanced filter.** Every "
+            "formulation was filtered out, so the tables below show their key "
+            "columns only. Relax or remove the Advanced filter (or tick *Include "
+            "experiments filtered out* in Results) to bring the columns back."
+        )
+    else:
+        st.warning("No experiment column passes the current filters.")
+        st.stop()
 
 col_tuples = []
 _seen_codes: dict[str, int] = {}
